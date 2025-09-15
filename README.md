@@ -8,6 +8,8 @@ In our benchmark, we tested the 4B SDAR model with block size 4 (basic accelerat
 
 This demonstrates that JetEngine can unlock production-level throughput for SDAR models, making it ideal for both research-scale batch inference and real-world deployment scenarios.
 ## 🚀 New Features
+[09/15/2025] Support completely offload the model and kv cache to free memory for RL training
+[09/14/2025] Support Hybrid Data Parallel and Tensor Parallel Inference
 [09/07/2025] Support [Entropy Bounded sampler](https://arxiv.org/abs/2505.24857)
 ```python
 SamplingParams(temperature=1.0, topk=0, topp=1.0, max_tokens=4096, remasking_strategy="entropy_bounded", block_length=4, denoising_steps=4, eb_threshold=0.6)
@@ -22,10 +24,21 @@ transformers>=4.52.4
 flash-attn
 ```
 
+For Local Inference:
+
 ```bash
 pip install flash-attn --no-build-isolation
 git clone https://github.com/Labman42/JetEngine.git
 cd JetEngine
+pip install .
+```
+For RL training usage (support DP and TP, managed by accelerate from huggingface):
+
+```bash
+pip install flash-attn --no-build-isolation
+git clone https://github.com/Labman42/JetEngine.git
+cd JetEngine
+git checkout accelerate
 pip install .
 ```
 
@@ -39,8 +52,10 @@ huggingface-cli download --resume-download JetLM/SDAR-1.7B-Chat \
 
 ## Quick Start
 
+On default, use all gpus for Data Parallel
+
 ```bash
-python example.py
+accelerate launch --multi_gpu dist_example.py
 ```
 
 See `example.py` for usage. The API mirrors vLLM's interface with some differences in the `LLM.generate` method.
