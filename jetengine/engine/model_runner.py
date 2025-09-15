@@ -49,6 +49,10 @@ class ModelRunner:
 
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
+        
+    def reinit_model(self):
+        self.model = self.ModelClass(
+            self.config.hf_config, self.dist_manager.tp_group)
 
     def exit(self):
         if not self.enforce_eager:

@@ -38,18 +38,107 @@ class LLMEngine:
         self.scheduler.consistent_sampling_params = False
         atexit.register(self.exit)
 
-    def offload_parameters(self):
+    def offload_parameters(self, include_buffers: bool = False):
         """
         Replace all parameter (and buffer) storages with meta tensors.
         Keeps shapes/dtypes, frees GPU/CPU memory.
         """
-        del self.model_runner.model
+
+        def offload_parameters_keep_buffers(model: torch.nn.Module):
+            """
+            Move *parameters* to meta to free memory while keeping buffers unchanged.
+            Works for any module tree.
+            """
+            # 1) Snapshot real buffers (module reference + buffer name + tensor)
+            saved_buffers = []
+            for mod in model.modules():
+                for bname, buf in list(mod._buffers.items()):
+                    if buf is not None:
+                        saved_buffers.append((mod, bname, buf))
+
+            # 2) Move everything to meta
+            model.to_empty(device=torch.device("meta"))
+
+            # 3) Restore the saved, real buffers
+            for mod, bname, buf in saved_buffers:
+                # Reattach the original tensor (device/dtype preserved)
+                mod._buffers[bname] = buf
+
+            torch.cuda.empty_cache()
+        if include_buffers:
+            self.model_runner.model.to_empty(device=torch.device("meta"))
+        else:
+            offload_parameters_keep_buffers(self.model_runner.model)
+
+        print("Successfully cleaned old parameters (buffers kept)." if not include_buffers
+              else "Successfully cleaned old parameters and buffers.")
+
+    def free_all_resources(self):
+        """
+        Completely frees all GPU resources: CUDAGraphs, Model, and KV Cache.
+        """
+        print("Freeing CUDAGraphs, Model, and KV Cache...")
+
+        if hasattr(self.model_runner, 'graphs'):
+            del self.model_runner.graphs
+            self.model_runner.graphs = {}
+        if hasattr(self.model_runner, 'graph_pool'):
+            del self.model_runner.graph_pool
+            self.model_runner.graph_pool = None
+
+        if hasattr(self.model_runner, 'model'):
+            del self.model_runner.model
+
+        if hasattr(self.model_runner, 'kv_cache'):
+            del self.model_runner.kv_cache
+
+        # 4. Free memory and reset peak stats
         torch.cuda.empty_cache()
-        self.model_runner.model = self.model_runner.ModelClass(
-            self.config.hf_config, process_group=self.dist_manager.tp_group).cuda()
+        torch.cuda.reset_peak_memory_stats()
+        print("GPU resources freed.")
 
     def reload_parameters(self, hf_model: nn.Module):
+        self.model_runner.reinit_model()
         load_from_hf_model(self.model_runner.model, hf_model=hf_model)
+
+    def reload_from_hf_model(self, hf_model: nn.Module):
+        """
+        Reloads the engine from a HuggingFace model.
+        This creates a new model shell, loads weights, re-allocates
+        the KV cache, and re-captures CUDAGraphs.
+        
+        Args:
+            hf_model (nn.Module): The HF model (CPU or GPU) to load weights from.
+        """
+        print("Reloading engine...")
+        original_device = torch.device(torch.get_default_device())
+        original_dtype = torch.get_default_dtype()
+
+        try:
+            torch.set_default_device("cuda")
+            torch.set_default_dtype(self.config.hf_config.torch_dtype)
+
+            self.model_runner.reinit_model()
+            print("Created new model shell.")
+
+            print("Reloading parameters...")
+            load_from_hf_model(self.model_runner.model, hf_model=hf_model)
+
+            print("Allocating new KV cache...")
+            self.model_runner.allocate_kv_cache()
+            print("New KV cache allocated.")
+
+            if not self.config.enforce_eager:
+                print("Re-capturing CUDAGraphs...")
+                self.model_runner.capture_cudagraph()
+                print("Graphs re-captured.")
+
+            print("Engine reload complete.")
+
+        finally:
+            torch.set_default_device(original_device)
+            torch.set_default_dtype(original_dtype)
+            print(f"Restored default device to {original_device}.")
 
     def exit(self):
         del self.model_runner
