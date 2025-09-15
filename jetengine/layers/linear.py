@@ -15,14 +15,17 @@ class LinearBase(nn.Module):
         self,
         input_size: int,
         output_size: int,
+        process_group: dist.ProcessGroup,
         tp_dim: int | None = None,
     ):
         super().__init__()
         self.input_size = input_size
         self.output_size = output_size
+        self.process_group = process_group  # Store the process group
         self.tp_dim = tp_dim
-        self.tp_rank = dist.get_rank()
-        self.tp_size = dist.get_world_size()
+        # Use the process group to get the correct rank and size
+        self.tp_rank = dist.get_rank(group=self.process_group)
+        self.tp_size = dist.get_world_size(group=self.process_group)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
@@ -34,9 +37,10 @@ class ReplicatedLinear(LinearBase):
         self,
         input_size: int,
         output_size: int,
+        process_group: dist.ProcessGroup,
         bias: bool = False,
     ):
-        super().__init__(input_size, output_size)
+        super().__init__(input_size, output_size, process_group)
         self.weight = nn.Parameter(torch.empty(self.output_size, self.input_size))
         self.weight.weight_loader = self.weight_loader
         if bias:
@@ -58,9 +62,10 @@ class ColumnParallelLinear(LinearBase):
         self,
         input_size: int,
         output_size: int,
+        process_group: dist.ProcessGroup,
         bias: bool = False,
     ):
-        super().__init__(input_size, output_size, 0)
+        super().__init__(input_size, output_size, process_group, 0)
         self.input_size_per_partition = input_size
         self.output_size_per_partition = divide(output_size, self.tp_size)
 
@@ -89,10 +94,11 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         self,
         input_size: int,
         output_sizes: list[int],
+        process_group: dist.ProcessGroup,
         bias: bool = False,
     ):
         self.output_sizes = output_sizes
-        super().__init__(input_size, sum(output_sizes), bias=bias)
+        super().__init__(input_size, sum(output_sizes), process_group, bias=bias)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int):
         param_data = param.data
@@ -109,6 +115,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         self,
         hidden_size: int,
         head_size: int,
+        process_group: dist.ProcessGroup,
         total_num_heads: int,
         total_num_kv_heads: int | None = None,
         bias: bool = False,
@@ -116,12 +123,12 @@ class QKVParallelLinear(ColumnParallelLinear):
         self.head_size = head_size
         self.total_num_heads = total_num_heads
         self.total_num_kv_heads = total_num_kv_heads or total_num_heads
-        tp_size = dist.get_world_size()
+        tp_size = dist.get_world_size(group=process_group)
         self.num_heads = divide(self.total_num_heads, tp_size)
         self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
         input_size = hidden_size
         output_size = (self.total_num_heads + 2 * self.total_num_kv_heads) * self.head_size
-        super().__init__(input_size, output_size, bias)
+        super().__init__(input_size, output_size, process_group, bias)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str):
         param_data = param.data
@@ -146,9 +153,10 @@ class RowParallelLinear(LinearBase):
         self,
         input_size: int,
         output_size: int,
+        process_group: dist.ProcessGroup,
         bias: bool = False,
     ):
-        super().__init__(input_size, output_size, 1)
+        super().__init__(input_size, output_size, process_group, 1)
         self.input_size_per_partition = divide(input_size, self.tp_size)
         self.output_size_per_partition = output_size
 
@@ -170,5 +178,5 @@ class RowParallelLinear(LinearBase):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:
-            dist.all_reduce(y)
+            dist.all_reduce(y, group=self.process_group)
         return y
