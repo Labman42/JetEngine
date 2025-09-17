@@ -6,7 +6,6 @@ from transformers import AutoTokenizer
 import torch
 from torch import nn
 from contextlib import nullcontext
-import torch.profiler as torch_profiler
 
 from jetengine.config import Config
 from jetengine.sampling_params import SamplingParams
@@ -35,7 +34,7 @@ class LLMEngine:
 
         self.config = config
         self.scheduler = Scheduler(config)
-        self.scheduler.consistent_sampling_params = False
+        self.scheduler.consistent_sampling_params = True
         atexit.register(self.exit)
 
     def offload_parameters(self, include_buffers: bool = False):
@@ -77,7 +76,7 @@ class LLMEngine:
         """
         Completely frees all GPU resources: CUDAGraphs, Model, and KV Cache.
         """
-        print("Freeing CUDAGraphs, Model, and KV Cache...")
+        # print("Freeing CUDAGraphs, Model, and KV Cache...")
 
         if hasattr(self.model_runner, 'graphs'):
             del self.model_runner.graphs
@@ -95,7 +94,7 @@ class LLMEngine:
         # 4. Free memory and reset peak stats
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        print("GPU resources freed.")
+        # print("GPU resources freed.")
 
     def reload_parameters(self, hf_model: nn.Module):
         self.model_runner.reinit_model()
@@ -110,35 +109,39 @@ class LLMEngine:
         Args:
             hf_model (nn.Module): The HF model (CPU or GPU) to load weights from.
         """
-        print("Reloading engine...")
+        # print("Reloading engine...")
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
         original_device = torch.device(torch.get_default_device())
         original_dtype = torch.get_default_dtype()
 
         try:
-            torch.set_default_device("cuda")
+            # torch.set_default_device("cuda")
             torch.set_default_dtype(self.config.hf_config.torch_dtype)
 
             self.model_runner.reinit_model()
-            print("Created new model shell.")
+            # print("Created new model shell.")
 
-            print("Reloading parameters...")
+            # print("Reloading parameters...")
             load_from_hf_model(self.model_runner.model, hf_model=hf_model)
 
-            print("Allocating new KV cache...")
+            # print("Allocating new KV cache...")
             self.model_runner.allocate_kv_cache()
-            print("New KV cache allocated.")
+            # print("New KV cache allocated.")
 
             if not self.config.enforce_eager:
-                print("Re-capturing CUDAGraphs...")
+                # print("Re-capturing CUDAGraphs...")
                 self.model_runner.capture_cudagraph()
-                print("Graphs re-captured.")
+            #     print("Graphs re-captured.")
 
-            print("Engine reload complete.")
+            # print("Engine reload complete.")
 
         finally:
             torch.set_default_device(original_device)
             torch.set_default_dtype(original_dtype)
-            print(f"Restored default device to {original_device}.")
+            self.scheduler = Scheduler(self.config)
+            self.scheduler.consistent_sampling_params = True
+            # print(f"Restored default device to {original_device}.")
 
     def exit(self):
         del self.model_runner
@@ -178,9 +181,6 @@ class LLMEngine:
         prompts: list[str] | list[list[int]],
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
-        # New optional profiling controls
-        profile: bool = False,
-        profile_dir: str | None = None,
     ) -> list[str]:
         # ... (This method remains largely the same, but the progress bar will update differently) ...
         # The logic inside the `while not self.is_finished()` loop correctly calls `self.step()`
@@ -198,39 +198,20 @@ class LLMEngine:
         total_generated_tokens = 0
         start_time = perf_counter()
 
-        # Setup profiler context
-        activities = [torch_profiler.ProfilerActivity.CPU]
-        if torch.cuda.is_available():
-            activities.append(torch_profiler.ProfilerActivity.CUDA)
-        trace_dir = profile_dir or "profiler_traces"
-        prof_ctx = (
-            torch_profiler.profile(
-                activities=activities,
-                record_shapes=True,
-                profile_memory=True,
-                on_trace_ready=torch_profiler.tensorboard_trace_handler(
-                    trace_dir),
-            )
-            if profile else nullcontext()
-        )
+        while not self.is_finished():
+            output, num_processed = self.step()
+            total_generated_tokens += num_processed
 
-        with prof_ctx as prof:
-            while not self.is_finished():
-                output, num_processed = self.step()
-                if profile:
-                    prof.step()
-                total_generated_tokens += num_processed
+            throughput = total_generated_tokens / \
+                (perf_counter() - start_time)
+            if use_tqdm:
+                pbar.set_postfix(
+                    {"Throughput": f"{int(throughput)} tok/s"})
 
-                throughput = total_generated_tokens / \
-                    (perf_counter() - start_time)
+            for seq_id, token_ids in output:
+                outputs[seq_id] = token_ids
                 if use_tqdm:
-                    pbar.set_postfix(
-                        {"Throughput": f"{int(throughput)} tok/s"})
-
-                for seq_id, token_ids in output:
-                    outputs[seq_id] = token_ids
-                    if use_tqdm:
-                        pbar.update(1)
+                    pbar.update(1)
 
         outputs = [outputs[seq_id] for seq_id in sorted(outputs)]
         outputs = [{"text": self.tokenizer.decode(
@@ -245,9 +226,6 @@ class LLMEngine:
         sampling_params: SamplingParams | list[SamplingParams],
         max_active: int | None = None,
         use_tqdm: bool = True,
-        # New optional profiling controls
-        profile: bool = False,
-        profile_dir: str | None = None,
     ) -> list[str]:
         """
         Stream prompts through the engine while keeping up to `max_active` sequences running.
@@ -276,47 +254,28 @@ class LLMEngine:
         total_generated_tokens = 0
         start_time = perf_counter()
 
-        # Setup profiler context
-        activities = [torch_profiler.ProfilerActivity.CPU]
-        if torch.cuda.is_available():
-            activities.append(torch_profiler.ProfilerActivity.CUDA)
-        trace_dir = profile_dir or "profiler_traces"
-        prof_ctx = (
-            torch_profiler.profile(
-                activities=activities,
-                record_shapes=True,
-                profile_memory=True,
-                on_trace_ready=torch_profiler.tensorboard_trace_handler(
-                    trace_dir),
-            )
-            if profile else nullcontext()
-        )
+        while not self.is_finished() or pending_idx < total:
+            # Top up to capacity before each step
+            running = getattr(self.scheduler, "running", [])
+            deficit = max_active - len(running)
+            while deficit > 0 and pending_idx < total:
+                self.add_request(
+                    prompts[pending_idx], sampling_params[pending_idx])
+                pending_idx += 1
+                deficit -= 1
 
-        with prof_ctx as prof:
-            while not self.is_finished() or pending_idx < total:
-                # Top up to capacity before each step
-                running = getattr(self.scheduler, "running", [])
-                deficit = max_active - len(running)
-                while deficit > 0 and pending_idx < total:
-                    self.add_request(
-                        prompts[pending_idx], sampling_params[pending_idx])
-                    pending_idx += 1
-                    deficit -= 1
+            output, num_processed = self.step()
+            total_generated_tokens += num_processed
 
-                output, num_processed = self.step()
-                if profile:
-                    prof.step()
-                total_generated_tokens += num_processed
+            if use_tqdm:
+                throughput = total_generated_tokens / \
+                    (perf_counter() - start_time + 1e-6)
+                pbar.set_postfix(
+                    {"Throughput": f"{int(throughput)} tok/s"})
+                pbar.update(len(output))
 
-                if use_tqdm:
-                    throughput = total_generated_tokens / \
-                        (perf_counter() - start_time + 1e-6)
-                    pbar.set_postfix(
-                        {"Throughput": f"{int(throughput)} tok/s"})
-                    pbar.update(len(output))
-
-                for seq_id, token_ids in output:
-                    outputs[seq_id] = token_ids
+            for seq_id, token_ids in output:
+                outputs[seq_id] = token_ids
 
         outputs_list = [outputs[seq_id] for seq_id in sorted(outputs)]
         results = [{"text": self.tokenizer.decode(

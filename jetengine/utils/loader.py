@@ -287,8 +287,8 @@ def load_from_hf_model(target_model: nn.Module, hf_model: nn.Module):
         param.requires_grad_(False)
 
     # Report loading status
-    print(
-        f"Successfully loaded {len(loaded_params)}/{len(list(target_model.named_parameters()))} parameters")
+    # print(
+    #     f"Successfully loaded {len(loaded_params)}/{len(list(target_model.named_parameters()))} parameters")
     if missing_params:
         print(
             f"Warning: Could not find {len(missing_params)} parameters in HF model:")
