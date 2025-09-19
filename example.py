@@ -1,15 +1,66 @@
 import os
+import time
 from jetengine import LLM, SamplingParams
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
+from torch.nn.utils.rnn import pad_sequence
+import torch.distributed as dist
 
 
 def main():
     #/mnt/shared-storage-user/bianyihan/volc/models
-    path = os.path.expanduser("/mnt/shared-storage-user/bianyihan/volc/models/SDAR-4B-Chat") # Path to your local model
+    # Path to your local model
+    path = os.path.expanduser(
+        "/mnt/shared-storage-user/dllm-share/Models/SDAR/SDAR-1.7B-Chat-b16/")
     tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
-    llm = LLM(path, enforce_eager=False, tensor_parallel_size=1, mask_token_id=151669, block_length=4) # Must set mask_token_id & block_length
-    # sampling_params = SamplingParams(temperature=1.0, topk=0, topp=1.0, max_tokens=4096, remasking_strategy="low_confidence_dynamic", block_length=8, denoising_steps=8, dynamic_threshold=0.9)
-    sampling_params = SamplingParams(temperature=1.0, topk=0, topp=1.0, max_tokens=4096, remasking_strategy="entropy_bounded", block_length=4, denoising_steps=4, eb_threshold=0.6)
+    llm = LLM(path, enforce_eager=False, tensor_parallel_size=1, mask_token_id=151669, block_length=16) # Must set mask_token_id & block_length
+    hf_model = AutoModelForCausalLM.from_pretrained(path, trust_remote_code=True).cuda()
+
+    # time.sleep(5)
+    # # 1. Delete CUDAGraphs (this breaks the reference to the model)
+    # if hasattr(llm.model_runner, 'graphs'):
+    #     del llm.model_runner.graphs
+    # if hasattr(llm.model_runner, 'graph_pool'):
+    #     del llm.model_runner.graph_pool
+
+    # # 2. Delete the Model
+    # if hasattr(llm.model_runner, 'model'):
+    #     del llm.model_runner.model
+
+    # # 3. Delete the KV Cache
+    # if hasattr(llm.model_runner, 'kv_cache'):
+    #     del llm.model_runner.kv_cache
+    # torch.cuda.empty_cache()
+
+    # time.sleep(5)
+    # # Save old defaults
+    # original_device = torch.device(torch.get_default_device())
+    # original_dtype = torch.get_default_dtype()
+
+    # # Set defaults to match ModelRunner __init__
+    # torch.set_default_device("cuda")
+    # torch.set_default_dtype(llm.config.hf_config.torch_dtype)
+    # torch.cuda.reset_peak_memory_stats()
+    # llm.reload_parameters(hf_model)
+    # print("Moving non-persistent buffers (like RoPE) to GPU...")
+    # # model_device = llm.model_runner.dist_manager.device
+    # # llm.model_runner.model.to(model_device)
+    # print("Buffers moved.")
+    # print("Setting default device and dtype for cache allocation...")
+
+    
+    # llm.model_runner.allocate_kv_cache()
+    # llm.model_runner.capture_cudagraph()
+    # torch.set_default_device(original_device)
+    # torch.set_default_dtype(original_dtype)
+    
+    llm.free_all_resources()
+    time.sleep(3)
+    llm.reload_from_hf_model(hf_model)
+    
+    sampling_params = SamplingParams(temperature=1.0, topk=0, topp=1.0, max_tokens=4096,
+                                     remasking_strategy="low_confidence_dynamic", block_length=16, denoising_steps=16, dynamic_threshold=0.9)
+    # sampling_params = SamplingParams(temperature=1.0, topk=0, topp=1.0, max_tokens=4096, remasking_strategy="entropy_bounded", block_length=4, denoising_steps=4, eb_threshold=0.6)
 
     prompts = [
         "Define\n\\[p = \\sum_{k = 1}^\\infty \\frac{1}{k^2} \\quad \\text{and} \\quad q = \\sum_{k = 1}^\\infty \\frac{1}{k^3}.\\]Find a way to write\n\\[\\sum_{j = 1}^\\infty \\sum_{k = 1}^\\infty \\frac{1}{(j + k)^3}\\]in terms of $p$ and $q.$\nPlease reason step by step, and put your final answer within \\boxed{}.\n",
@@ -27,22 +78,30 @@ def main():
         "The solution to $-4 < 2(x - 1) < 8$ is expressed in the form $a < x < b$. Find the value of $a + b$.\nPlease reason step by step, and put your final answer within \\boxed{}.\n",
         "Bill walks $\\frac{1}{2}$ mile south, then $\\frac{3}{4}$ mile east, and finally $\\frac{1}{2}$ mile south. How many miles is he, in a direct line, from his starting point?  Express your answer as a decimal to the nearest hundredth.\nPlease reason step by step, and put your final answer within \\boxed{}.\n"
     ]
-    prompts = [
+    prompts_list = [
         tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],
-            tokenize=False,
+            tokenize=True,
             add_generation_prompt=True,
             enable_thinking=True
         )
         for prompt in prompts
     ]
-    outputs = llm.generate_streaming([prompts[0]], sampling_params, max_active=64) # Example for single sample inference
-    outputs = llm.generate_streaming(prompts*20, sampling_params, max_active=128) # Example for batch inference
+    # Example for single sample inference
+    outputs = llm.generate_streaming(
+        [prompts_list[0]], sampling_params, max_active=64)
+    # for _ in range(10):
+    if dist.get_rank() // 2 == 0:
+        outputs = llm.generate_streaming(
+            prompts_list[:2], sampling_params, max_active=128)  # Example for batch inference
+    else:
+        outputs = llm.generate_streaming(
+            prompts_list[2:4], sampling_params, max_active=128)  # Example for batch inference
 
     for prompt, output in zip(prompts, outputs):
         print("\n")
-        print(f"Prompt: {prompt!r}")
-        print(f"Completion: {output['text']!r}")
+        print(f"[{dist.get_rank()}] Prompt: {prompt!r}")
+        print(f"[{dist.get_rank()}]Completion: {output['text']!r}")
 
 
 if __name__ == "__main__":
