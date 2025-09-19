@@ -116,7 +116,7 @@ class LLMEngine:
         original_dtype = torch.get_default_dtype()
 
         try:
-            # torch.set_default_device("cuda")
+            torch.set_default_device("cuda")
             torch.set_default_dtype(self.config.hf_config.torch_dtype)
 
             self.model_runner.reinit_model()
