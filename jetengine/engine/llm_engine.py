@@ -214,11 +214,20 @@ class LLMEngine:
                     pbar.update(1)
 
         outputs = [outputs[seq_id] for seq_id in sorted(outputs)]
-        outputs = [{"text": self.tokenizer.decode(
-            token_ids), "token_ids": token_ids} for token_ids in outputs]
+        
+        safe_outputs = []
+        for token_ids in outputs:
+            try:
+                text = self.tokenizer.decode(token_ids)
+            except Exception as e:
+                print(
+                    f"[Warning] Decode failed for token_ids={token_ids}. Set the token to EOS.")
+                token_ids = [self.tokenizer.eos_token_id]
+                text = self.tokenizer.decode(token_ids)
+            safe_outputs.append({"text": text, "token_ids": token_ids})
         if use_tqdm:
             pbar.close()
-        return outputs
+        return safe_outputs
 
     def generate_streaming(
         self,
@@ -277,10 +286,19 @@ class LLMEngine:
             for seq_id, token_ids in output:
                 outputs[seq_id] = token_ids
 
-        outputs_list = [outputs[seq_id] for seq_id in sorted(outputs)]
-        results = [{"text": self.tokenizer.decode(
-            token_ids), "token_ids": token_ids} for token_ids in outputs_list]
+        outputs = [outputs[seq_id] for seq_id in sorted(outputs)]
+        
+        safe_outputs = []
+        for token_ids in outputs:
+            try:
+                text = self.tokenizer.decode(token_ids)
+            except Exception as e:
+                print(
+                    f"[Warning] Decode failed for token_ids={token_ids}. Set the token to EOS.")
+                token_ids = [self.tokenizer.eos_token_id]
+                text = self.tokenizer.decode(token_ids)
+            safe_outputs.append({"text": text, "token_ids": token_ids})
 
         if use_tqdm:
             pbar.close()
-        return results
+        return safe_outputs
