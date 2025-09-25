@@ -176,7 +176,7 @@ class LLMEngine:
     def is_finished(self):
         return self.scheduler.is_finished()
 
-    def generate(
+   def generate(
         self,
         prompts: list[str] | list[list[int]],
         sampling_params: SamplingParams | list[SamplingParams],
@@ -194,12 +194,22 @@ class LLMEngine:
         for prompt, sp in zip(prompts, sampling_params):
             self.add_request(prompt, sp)
         outputs = {}
+        stall_counter = 0
 
         total_generated_tokens = 0
         start_time = perf_counter()
 
         while not self.is_finished():
             output, num_processed = self.step()
+            
+            if not output and not self.is_finished() and num_processed == 0:
+                stall_counter += 1
+                if stall_counter > 3:
+                    print("\n[Warning] Deadlock detected: No progress can be made because all sequences are waiting for KV cache blocks, but no blocks are free. This can happen if the batch size is too large for the available KV cache. Try reducing the number of concurrent requests.")
+                    break
+            else:
+                stall_counter = 0
+
             total_generated_tokens += num_processed
 
             throughput = total_generated_tokens / \
@@ -253,6 +263,7 @@ class LLMEngine:
 
         outputs: dict[int, list[int]] = {}
         pending_idx = 0
+        stall_counter = 0
 
         # Prime initial requests up to capacity
         initial = min(max_active, total)
@@ -274,6 +285,15 @@ class LLMEngine:
                 deficit -= 1
 
             output, num_processed = self.step()
+            
+            if not output and not self.is_finished() and num_processed == 0 and pending_idx == total:
+                stall_counter += 1
+                if stall_counter > 3:
+                    print("\n[Warning] Deadlock detected: No progress can be made because all sequences are waiting for KV cache blocks, but no blocks are free. This can happen if the batch size is too large for the available KV cache. Try reducing the number of concurrent requests.")
+                    break
+            else:
+                stall_counter = 0
+                
             total_generated_tokens += num_processed
 
             if use_tqdm:
