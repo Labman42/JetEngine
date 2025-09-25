@@ -38,6 +38,10 @@ class Sequence:
         self.intermediate_block_tokens = first_denoise_part + [mask_token_id] * (self.block_length - len(first_denoise_part))
         self.num_to_transfer = 0
         self.current_denoising_step = 0
+
+        self.trajectory: list[int] = []
+        self.block_trajectory: list[int] | None = [0] * len(self.intermediate_block_tokens)
+        self.global_denoising_step = 0
         
         # initial status based on whether prefill is needed.
         if self.num_prefill_tokens > 0:
@@ -94,10 +98,19 @@ class Sequence:
                 self.status = SequenceStatus.FINISHED
                 break
             final_block.append(token_id)
-
+            
+        before_ntok = self.num_tokens
         self.token_ids.extend(final_block)
         self.num_tokens = len(self.token_ids)
         self.intermediate_block_tokens = []
+        
+        block_len = len(block_tokens)
+        if self.block_trajectory is not None:
+            block_start = max(0, self.num_prompt_tokens - before_ntok)
+            start = min(block_start, block_len)
+            if start < block_len:
+                self.trajectory.extend(self.block_trajectory[start:block_len])
+            self.block_trajectory = None
 
         if self.num_tokens >= self.num_prompt_tokens + self.max_tokens:
              self.status = SequenceStatus.FINISHED

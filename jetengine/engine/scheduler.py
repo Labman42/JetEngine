@@ -138,12 +138,21 @@ class Scheduler:
                     new_block_list = current_block_tensor.tolist()
                     accepted_tokens = seq_x0[transfer_index].tolist()
                     original_indices = transfer_index.nonzero(as_tuple=True)[0].tolist()
+                    
+                    # track trajectory
+                    if seq.block_trajectory is None or len(seq.block_trajectory) != block_len:
+                        seq.block_trajectory = [0] * block_len
+                    first_time_global = seq.global_denoising_step + 1
+                    for idx in original_indices:
+                        if seq.block_trajectory[idx] == 0:
+                            seq.block_trajectory[idx] = first_time_global
 
                     for idx, token in zip(original_indices, accepted_tokens):
                         new_block_list[idx] = token
                     seq.intermediate_block_tokens = new_block_list
                     
                     seq.current_denoising_step += 1
+                    seq.global_denoising_step += 1
                     
                     # Check if block is fully denoised
                     is_fully_denoised = (self.mask_token_id not in seq.intermediate_block_tokens) or \

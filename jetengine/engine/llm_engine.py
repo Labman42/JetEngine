@@ -165,7 +165,7 @@ class LLMEngine:
         logits = self.model_runner.run(scheduled_seqs, run_type)
         self.scheduler.postprocess(scheduled_seqs, logits, run_type)
 
-        finished_outputs = [(seq.seq_id, seq.completion_token_ids)
+        finished_outputs = [(seq.seq_id, seq.completion_token_ids, seq.trajectory)
                             for seq in scheduled_seqs if seq.is_finished]
 
         # Throughput calculation needs to be adapted for block-wise generation
@@ -218,15 +218,17 @@ class LLMEngine:
                 pbar.set_postfix(
                     {"Throughput": f"{int(throughput)} tok/s"})
 
-            for seq_id, token_ids in output:
-                outputs[seq_id] = token_ids
+            for seq_id, token_ids, trajectory in output:
+                outputs[seq_id] = {"token_ids": token_ids, "trajectory": trajectory}
                 if use_tqdm:
                     pbar.update(1)
 
         outputs = [outputs[seq_id] for seq_id in sorted(outputs)]
         
         safe_outputs = []
-        for token_ids in outputs:
+        for output in outputs:
+            token_ids = output["token_ids"]
+            trajectory = output["trajectory"]
             try:
                 text = self.tokenizer.decode(token_ids)
             except Exception as e:
@@ -234,7 +236,7 @@ class LLMEngine:
                     f"[Warning] Decode failed for token_ids={token_ids}. Set the token to EOS.")
                 token_ids = [self.tokenizer.eos_token_id]
                 text = self.tokenizer.decode(token_ids)
-            safe_outputs.append({"text": text, "token_ids": token_ids})
+            safe_outputs.append({"text": text, "token_ids": token_ids, "trajectory": trajectory})
         if use_tqdm:
             pbar.close()
         return safe_outputs
@@ -303,13 +305,15 @@ class LLMEngine:
                     {"Throughput": f"{int(throughput)} tok/s"})
                 pbar.update(len(output))
 
-            for seq_id, token_ids in output:
-                outputs[seq_id] = token_ids
+            for seq_id, token_ids, trajectory in output:
+                outputs[seq_id] = {"token_ids": token_ids, "trajectory": trajectory}
 
         outputs = [outputs[seq_id] for seq_id in sorted(outputs)]
         
         safe_outputs = []
-        for token_ids in outputs:
+        for output in outputs:
+            token_ids = output["token_ids"]
+            trajectory = output["trajectory"]
             try:
                 text = self.tokenizer.decode(token_ids)
             except Exception as e:
@@ -317,7 +321,7 @@ class LLMEngine:
                     f"[Warning] Decode failed for token_ids={token_ids}. Set the token to EOS.")
                 token_ids = [self.tokenizer.eos_token_id]
                 text = self.tokenizer.decode(token_ids)
-            safe_outputs.append({"text": text, "token_ids": token_ids})
+            safe_outputs.append({"text": text, "token_ids": token_ids, "trajectory": trajectory})
 
         if use_tqdm:
             pbar.close()
