@@ -176,12 +176,12 @@ class LLMEngine:
     def is_finished(self):
         return self.scheduler.is_finished()
 
-   def generate(
+    def generate(
         self,
         prompts: list[str] | list[list[int]],
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
-    ) -> list[str]:
+        ) -> list[str]:
         # ... (This method remains largely the same, but the progress bar will update differently) ...
         # The logic inside the `while not self.is_finished()` loop correctly calls `self.step()`
         # and collects outputs.
@@ -247,7 +247,7 @@ class LLMEngine:
         sampling_params: SamplingParams | list[SamplingParams],
         max_active: int | None = None,
         use_tqdm: bool = True,
-    ) -> list[str]:
+        ) -> list[str]:
         """
         Stream prompts through the engine while keeping up to `max_active` sequences running.
         As sequences finish, new prompts are added from the pending list to maximize GPU utilization.
