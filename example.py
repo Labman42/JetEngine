@@ -26,7 +26,7 @@ def main():
             enforce_eager=False, 
             tensor_parallel_size=1, 
             mask_token_id=151669,  # Required for SDAR models
-            block_length=16
+            block_length=4
         )
         print("Model loaded successfully!")
         
@@ -44,8 +44,8 @@ def main():
         topp=1.0, 
         max_tokens=4096,
         remasking_strategy="low_confidence_dynamic", 
-        block_length=16, 
-        denoising_steps=16, 
+        block_length=4, 
+        denoising_steps=4, 
         dynamic_threshold=0.9
     )
 
