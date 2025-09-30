@@ -11,7 +11,7 @@ def main():
     llm = LLM(path, enforce_eager=False, tensor_parallel_size=1, mask_token_id=151669, block_length=4) # Must set mask_token_id & block_length
     sampling_params = SamplingParams(temperature=1.0, topk=0, topp=1.0, max_tokens=4096,
                                      remasking_strategy="low_confidence_dynamic", block_length=4, denoising_steps=4, dynamic_threshold=0.9)
-
+    llm.free_all_resources()
     prompts = [
         "Define\n\\[p = \\sum_{k = 1}^\\infty \\frac{1}{k^2} \\quad \\text{and} \\quad q = \\sum_{k = 1}^\\infty \\frac{1}{k^3}.\\]Find a way to write\n\\[\\sum_{j = 1}^\\infty \\sum_{k = 1}^\\infty \\frac{1}{(j + k)^3}\\]in terms of $p$ and $q.$\nPlease reason step by step, and put your final answer within \\boxed{}.\n",
         "Convert the point $(0,3)$ in rectangular coordinates to polar coordinates.  Enter your answer in the form $(r,\\theta),$ where $r > 0$ and $0 \\le \\theta < 2 \\pi.$\nPlease reason step by step, and put your final answer within \\boxed{}.\n",
@@ -38,6 +38,8 @@ def main():
         for prompt in prompts
     ]
     # Example for single sample inference
+    hf_model = AutoModelForCausalLM.from_pretrained(path, trust_remote_code=True).cuda()
+    llm.reload_from_hf_model(hf_model)
     outputs = llm.generate_streaming(
         [prompts_list[0]], sampling_params, max_active=64)
     if dist.get_rank() // 2 == 0:
