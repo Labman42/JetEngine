@@ -1,17 +1,17 @@
 import os
 from jetengine import LLM, SamplingParams
 from transformers import AutoTokenizer, AutoModelForCausalLM
-import torch
 import torch.distributed as dist
 
 
 def main():
-    path = os.path.expanduser("<Your Model Path>")
+    path = os.path.expanduser("/mnt/shared-storage-user/liudawei/Models/SDAR/SDAR-4B-Chat")
     tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
     llm = LLM(path, enforce_eager=False, tensor_parallel_size=1, mask_token_id=151669, block_length=4) # Must set mask_token_id & block_length
     sampling_params = SamplingParams(temperature=1.0, topk=0, topp=1.0, max_tokens=4096,
                                      remasking_strategy="low_confidence_dynamic", block_length=4, denoising_steps=4, dynamic_threshold=0.9)
     llm.free_all_resources()
+
     prompts = [
         "Define\n\\[p = \\sum_{k = 1}^\\infty \\frac{1}{k^2} \\quad \\text{and} \\quad q = \\sum_{k = 1}^\\infty \\frac{1}{k^3}.\\]Find a way to write\n\\[\\sum_{j = 1}^\\infty \\sum_{k = 1}^\\infty \\frac{1}{(j + k)^3}\\]in terms of $p$ and $q.$\nPlease reason step by step, and put your final answer within \\boxed{}.\n",
         "Convert the point $(0,3)$ in rectangular coordinates to polar coordinates.  Enter your answer in the form $(r,\\theta),$ where $r > 0$ and $0 \\le \\theta < 2 \\pi.$\nPlease reason step by step, and put your final answer within \\boxed{}.\n",
@@ -42,17 +42,23 @@ def main():
     llm.reload_from_hf_model(hf_model)
     outputs = llm.generate_streaming(
         [prompts_list[0]], sampling_params, max_active=64)
+    print(outputs[0]['trajectory'])
     if dist.get_rank() // 2 == 0:
         outputs = llm.generate_streaming(
-            prompts_list[:6], sampling_params, max_active=128)  # Example for batch inference
+            prompts_list[:6]*20, sampling_params, max_active=128)  # Example for batch inference
     else:
         outputs = llm.generate_streaming(
-            prompts_list[6:13], sampling_params, max_active=128)  # Example for batch inference
+            prompts_list[6:13]*20, sampling_params, max_active=128)  # Example for batch inference
 
     for prompt, output in zip(prompts, outputs):
+    # for output in outputs:
         print("\n")
-        print(f"[{dist.get_rank()}] Prompt: {prompt!r}")
-        print(f"[{dist.get_rank()}]Completion: {output['text']!r}")
+        # print(f"[{dist.get_rank()}] Prompt: {prompt!r}")
+        print(f"[{dist.get_rank()}] Completion: {output['text']!r}")
+        print(f"[{dist.get_rank()}] Total Length: {len(output['token_ids'])!r}")
+        print(f"[{dist.get_rank()}] Trajectory: {output['trajectory']!r}")
+        print(f"[{dist.get_rank()}] Total Length: {len(output['trajectory'])!r}")
+        print(f"[{dist.get_rank()}] Speed up: {len(output['trajectory']) / output['trajectory'][-1]!r}")
 
 
 if __name__ == "__main__":

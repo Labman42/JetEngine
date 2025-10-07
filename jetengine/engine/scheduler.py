@@ -8,7 +8,10 @@ from jetengine.engine.sequence import Sequence, SequenceStatus, RunType
 from jetengine.engine.block_manager import BlockManager
 from jetengine.layers.sampler import sample_with_temperature_topk_topp
 from flashinfer.logits_processor import LogitsPipe, Temperature, Softmax, TopP, TopK, Sample
+from flashinfer.sampling import top_p_sampling_from_probs, top_k_top_p_sampling_from_probs
+from torch.distributions import Categorical
 
+EPS = 1e-12
 
 class Scheduler:
 
@@ -21,15 +24,8 @@ class Scheduler:
         self.running: list[Sequence] = []
         self.sample_pipe = LogitsPipe([
                                 Temperature(),      # Scale logits by temperature
-                                TopK(),             # Apply top-k filtering
                                 Softmax(),          # Convert logits to probabilities
-                                TopP(),             # Apply top-p filtering
                             ])
-        self.sample_pipe_topk0 = LogitsPipe([
-                        Temperature(),      # Scale logits by temperature
-                        Softmax(),          # Convert logits to probabilities
-                        TopP(),             # Apply top-p filtering
-                        ])
 
     def add(self, seq: Sequence):
         self.running.append(seq)
@@ -73,25 +69,22 @@ class Scheduler:
         
         elif run_type == RunType.DENOISE:
             start_idx = 0
-            if self.consistent_sampling_params:
-                if seqs[0].top_k > 0:
-                    probs = self.sample_pipe(logits, temperature=seqs[0].temperature, top_k=seqs[0].top_k, top_p=seqs[0].top_p) 
-                else:
-                    probs = self.sample_pipe_topk0(logits, temperature=seqs[0].temperature, top_p=seqs[0].top_p)
+            if self.consistent_sampling_params: # Assume in training environment
+                probs = self.sample_pipe(logits, temperature=seqs[0].temperature)
+                entropies = -(probs.clamp_min(EPS) * (probs.clamp_min(EPS)).log()).sum(dim=-1)
+                batch_seq_x0 = top_k_top_p_sampling_from_probs(probs, top_k=seqs[0].top_k, top_p=seqs[0].top_p).to(torch.int64)
+                batch_seq_x0_p = torch.gather(probs, -1, batch_seq_x0.unsqueeze(-1)).squeeze(-1)    
             for seq in seqs:
                 # Extract the part of the tensors relevant to this sequence
                 if seq.status == SequenceStatus.DENOISING:
                     block_len = seq.block_length
                     if not self.consistent_sampling_params:
-                        if seq.top_k > 0:
-                            probs = self.sample_pipe(logits[start_idx : start_idx + block_len], temperature=seq.temperature, top_k=seq.top_k, top_p=seq.top_p) 
-                        else:
-                            probs = self.sample_pipe_topk0(logits[start_idx : start_idx + block_len], temperature=seq.temperature, top_p=seq.top_p)
-                        seq_x0 = torch.multinomial(probs, num_samples=1).squeeze(-1) 
+                        probs = self.sample_pipe(logits[start_idx : start_idx + block_len], temperature=seq.temperature)
+                        seq_x0 = top_k_top_p_sampling_from_probs(probs, top_k=seq.top_k, top_p=seq.top_p).to(torch.int64)
                         seq_x0_p = torch.gather(probs, -1, seq_x0.unsqueeze(-1)).squeeze(-1)    
                     else:
-                        seq_x0 = torch.multinomial(probs[start_idx : start_idx + block_len], num_samples=1).squeeze(-1) 
-                        seq_x0_p = torch.gather(probs[start_idx : start_idx + block_len], -1, seq_x0.unsqueeze(-1)).squeeze(-1)    
+                        seq_x0 = batch_seq_x0[start_idx : start_idx + block_len]
+                        seq_x0_p = batch_seq_x0_p[start_idx : start_idx + block_len]
                     
                     current_block_tensor = torch.tensor(seq.intermediate_block_tokens, device=logits.device)
                     mask_index = (current_block_tensor == self.mask_token_id)
@@ -121,8 +114,7 @@ class Scheduler:
                     elif 'entropy_bounded' in seq.remasking_strategy:
                         block_probs = probs[start_idx : start_idx + block_len]
                         P = block_probs[mask_index]
-                        eps = 1e-12
-                        entropies = -(P.clamp_min(eps) * (P.clamp_min(eps)).log()).sum(dim=-1)
+                        entropies = -(P.clamp_min(EPS) * (P.clamp_min(EPS)).log()).sum(dim=-1)
                         ent_sorted, order = torch.sort(entropies, dim=0, descending=False)
                         cumsum = torch.cumsum(ent_sorted, dim=0)
                         k = torch.searchsorted(cumsum, torch.tensor(seq.eb_threshold, device=P.device), right=False).item()
@@ -137,6 +129,8 @@ class Scheduler:
                     # update
                     new_block_list = current_block_tensor.tolist()
                     accepted_tokens = seq_x0[transfer_index].tolist()
+                    accepted_tokens_entropy = entropies[start_idx : start_idx + block_len][transfer_index].tolist()
+                    new_block_list_entropy = torch.tensor(seq.intermediate_block_tokens_entropy, device=logits.device).tolist()
                     original_indices = transfer_index.nonzero(as_tuple=True)[0].tolist()
                     
                     # track trajectory
@@ -147,9 +141,11 @@ class Scheduler:
                         if seq.block_trajectory[idx] == 0:
                             seq.block_trajectory[idx] = first_time_global
 
-                    for idx, token in zip(original_indices, accepted_tokens):
+                    for idx, token, entropy in zip(original_indices, accepted_tokens, accepted_tokens_entropy):
                         new_block_list[idx] = token
+                        new_block_list_entropy[idx] = entropy
                     seq.intermediate_block_tokens = new_block_list
+                    seq.intermediate_block_tokens_entropy = new_block_list_entropy
                     
                     seq.current_denoising_step += 1
                     seq.global_denoising_step += 1

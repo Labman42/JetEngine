@@ -164,9 +164,26 @@ class LLMEngine:
 
         logits = self.model_runner.run(scheduled_seqs, run_type)
         self.scheduler.postprocess(scheduled_seqs, logits, run_type)
-
-        finished_outputs = [(seq.seq_id, seq.completion_token_ids, seq.trajectory)
-                            for seq in scheduled_seqs if seq.is_finished]
+        finished_outputs = []
+        for seq in scheduled_seqs:
+            if seq.is_finished:
+                if self.config.max_model_len:
+                    seq.token_ids = seq.token_ids[:self.config.max_model_len]
+                    response_len = min(
+                        self.config.max_model_len - len(seq.prompt_token_ids), len(seq.completion_token_ids))
+                    
+                    seq.trajectory = seq.trajectory[:response_len]
+                # print("jetengine trajectory", len(
+                #     seq.trajectory), seq.trajectory)
+                finished_outputs.append((
+                    seq.seq_id, 
+                    seq.token_ids, 
+                    seq.trajectory,
+                    # seq.trajectory[:len(seq.completion_token_ids)]
+                ))
+                            
+        # finished_outputs = [(seq.seq_id, seq.completion_token_ids, seq.trajectory[:len(seq.completion_token_ids)])
+        #                     for seq in scheduled_seqs if seq.is_finished]
 
         # Throughput calculation needs to be adapted for block-wise generation
         num_tokens = [self.scheduler.running[i].num_to_transfer if hasattr(

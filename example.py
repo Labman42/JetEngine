@@ -6,7 +6,6 @@ from transformers import AutoTokenizer
 def main():
     """
     Example usage of JetEngine with SDAR model for mathematical problem solving.
-    
     This example demonstrates:
     - Loading a pre-trained SDAR model
     - Configuring sampling parameters for block diffusion

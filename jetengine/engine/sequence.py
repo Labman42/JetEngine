@@ -36,6 +36,8 @@ class Sequence:
         self.num_prompt_tokens = prompt_len # Keep track of the original full prompt length
         
         self.intermediate_block_tokens = first_denoise_part + [mask_token_id] * (self.block_length - len(first_denoise_part))
+        self.intermediate_block_tokens_entropy = [0.0] * self.block_length
+        
         self.num_to_transfer = 0
         self.current_denoising_step = 0
 
@@ -84,6 +86,7 @@ class Sequence:
     def start_new_block(self):
         self.current_denoising_step = 0
         self.intermediate_block_tokens = [self.mask_token_id] * self.block_length
+        self.intermediate_block_tokens_entropy = [0.0] * self.block_length
         self.status = SequenceStatus.DENOISING
 
     def commit_block(self, block_tokens: list[int]):
@@ -100,9 +103,10 @@ class Sequence:
             final_block.append(token_id)
             
         before_ntok = self.num_tokens
-        self.token_ids.extend(final_block)
+        self.token_ids.extend(block_tokens)
         self.num_tokens = len(self.token_ids)
         self.intermediate_block_tokens = []
+        self.intermediate_block_tokens_entropy =[]
         
         block_len = len(block_tokens)
         if self.block_trajectory is not None:
