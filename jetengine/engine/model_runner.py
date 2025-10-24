@@ -100,7 +100,7 @@ class ModelRunner:
                         (max_len - len(seq.block_table)) for seq in seqs]
         return torch.tensor(block_tables, dtype=torch.int32).cuda()
 
-    def prepare_prefill(self, seqs: list[Sequence]):
+    def prepare_prefill_loop(self, seqs: list[Sequence]):
         input_ids, positions, cu_seqlens_q, slot_mapping, is_last_step = [], [], [0], [], []
         max_seqlen_q = 0
         for seq in seqs:
@@ -139,7 +139,97 @@ class ModelRunner:
         )
         return input_ids, positions
 
-    def prepare_denoise(self, seqs: list[Sequence]):
+    def prepare_prefill(self, seqs: list[Sequence]):
+        device = torch.device("cuda") 
+        all_token_ids_flat = []
+        all_block_tables_flat = []
+        seqlens_list = []
+        block_table_lens_list = []
+        is_last_step_list = []
+
+        for seq in seqs:
+            seq_len = len(seq.token_ids)
+            seqlens_list.append(seq_len)
+            all_token_ids_flat.extend(seq.token_ids)
+            is_last_step_list.append(False)
+
+            if seq.block_table:
+                block_table_lens_list.append(len(seq.block_table))
+                all_block_tables_flat.extend(seq.block_table)
+            else:
+                block_table_lens_list.append(0)
+        
+        # (total_tokens,)
+        input_ids = torch.tensor(all_token_ids_flat, dtype=torch.int64, device=device)
+        
+        # (total_physical_blocks,)
+        flat_block_tables = torch.tensor(
+            all_block_tables_flat, dtype=torch.int32, device=device
+        )
+        
+        # (B,)
+        seqlens_q = torch.tensor(seqlens_list, dtype=torch.int32, device=device)
+        block_table_lens = torch.tensor(
+            block_table_lens_list, dtype=torch.int32, device=device
+        )
+        is_last_step = torch.tensor(is_last_step_list, dtype=torch.bool, device=device)
+        
+        batch_size = len(seqs)
+        if batch_size == 0:
+            # Handle empty batch case
+            cu_seqlens_q = torch.tensor([0], dtype=torch.int32, device=device)
+            max_seqlen_q = 0
+            positions = torch.empty(0, dtype=torch.int64, device=device)
+            slot_mapping = torch.empty(0, dtype=torch.int32, device=device)
+        else:
+            # (B+1,)
+            cu_seqlens_q = torch.nn.functional.pad(
+                seqlens_q.cumsum(dim=0, dtype=torch.int32), (1, 0)
+            )
+            cu_block_table_lens = torch.nn.functional.pad(
+                block_table_lens.cumsum(dim=0, dtype=torch.int32), (1, 0)
+            )
+            max_seqlen_q = seqlens_q.max().item()
+            total_tokens = input_ids.shape[0]
+            token_indices_global = torch.arange(total_tokens, dtype=torch.int64, device=device)
+            seq_start_offsets = torch.repeat_interleave(
+                cu_seqlens_q[:-1], repeats=seqlens_q
+            )
+            positions = token_indices_global - seq_start_offsets # This is `i`
+            
+            # [True, False, True, ...] (B,)
+            has_block_table_mask_per_seq = (block_table_lens > 0)
+            # [T, T, T, F, F, T, T, T, T, ...] (total_tokens,)
+            has_block_table_mask_per_token = torch.repeat_interleave(
+                has_block_table_mask_per_seq, repeats=seqlens_q
+            )
+            # Filter `positions` to only those that need a slot
+            # (total_slots,)
+            i = positions[has_block_table_mask_per_token]
+            # (total_tokens,)
+            seq_idx_for_each_token = torch.repeat_interleave(
+                torch.arange(batch_size, device=device), repeats=seqlens_q
+            )
+            seq_idx_with_slot = seq_idx_for_each_token[has_block_table_mask_per_token]
+            block_idx = i // self.block_size
+            block_offset = i % self.block_size
+            block_table_start_offsets = cu_block_table_lens[seq_idx_with_slot]
+            block_table_global_idx = block_table_start_offsets + block_idx
+            physical_block_id = flat_block_tables[block_table_global_idx]
+            slot_mapping = physical_block_id * self.block_size + block_offset
+        set_context(
+            run_type=RunType.PREFILL,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_q,
+            slot_mapping=slot_mapping.to(torch.int32), # Ensure int32
+            is_last_denoise_step=is_last_step,
+            block_length=self.config.block_length
+        )
+        return input_ids, positions
+
+    def prepare_denoise_loop(self, seqs: list[Sequence]):
         input_ids, positions = [], []
         cached_lens = []
 
@@ -169,6 +259,42 @@ class ModelRunner:
         )
 
         return input_ids, positions
+    
+    def prepare_denoise(self, seqs: list[Sequence]):
+        block_len = len(seqs[0].intermediate_block_tokens)
+        device = torch.device("cuda")
+        cached_lens = torch.tensor(
+            [len(seq) for seq in seqs], 
+            dtype=torch.int32, 
+            device=device
+        )
+        
+        input_ids_list = [seq.intermediate_block_tokens for seq in seqs]
+        input_ids = torch.tensor(
+            input_ids_list, 
+            dtype=torch.int64, 
+            device=device
+        ).view(-1) # Flatten to (B * L,)
+
+        start_positions = cached_lens.unsqueeze(1)
+        offsets = torch.arange(
+            block_len, 
+            dtype=torch.int64, 
+            device=device
+        ).unsqueeze(0)
+
+        positions = (start_positions + offsets).view(-1) # Flatten to (B * L,)
+        block_tables = self.prepare_block_tables(seqs)
+
+        set_context(
+            run_type=RunType.DENOISE,
+            context_lens=cached_lens,
+            block_tables=block_tables,
+            block_length=self.config.block_length
+        )
+
+        return input_ids, positions
+
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor):

@@ -173,13 +173,16 @@ class LLMEngine:
                         self.config.max_model_len - len(seq.prompt_token_ids), len(seq.completion_token_ids))
                     
                     seq.trajectory = seq.trajectory[:response_len]
+                    seq.logprobs = seq.logprobs[:response_len]
+                    seq.entropies = seq.entropies[:response_len]
                 # print("jetengine trajectory", len(
                 #     seq.trajectory), seq.trajectory)
                 finished_outputs.append((
                     seq.seq_id, 
                     seq.token_ids, 
                     seq.trajectory,
-                    # seq.trajectory[:len(seq.completion_token_ids)]
+                    seq.logprobs,  # NEW
+                    seq.entropies  # NEW
                 ))
                             
         # finished_outputs = [(seq.seq_id, seq.completion_token_ids, seq.trajectory[:len(seq.completion_token_ids)])
@@ -235,8 +238,13 @@ class LLMEngine:
                 pbar.set_postfix(
                     {"Throughput": f"{int(throughput)} tok/s"})
 
-            for seq_id, token_ids, trajectory in output:
-                outputs[seq_id] = {"token_ids": token_ids, "trajectory": trajectory}
+            for seq_id, token_ids, trajectory, logprobs, entropies in output:  # Updated unpacking
+                outputs[seq_id] = {
+                    "token_ids": token_ids, 
+                    "trajectory": trajectory,
+                    "logprobs": logprobs,  # NEW
+                    "entropies": entropies  # NEW
+                }
                 if use_tqdm:
                     pbar.update(1)
 
@@ -246,14 +254,22 @@ class LLMEngine:
         for output in outputs:
             token_ids = output["token_ids"]
             trajectory = output["trajectory"]
+            logprobs = output["logprobs"]  # NEW
+            entropies = output["entropies"]  # NEW
             try:
                 text = self.tokenizer.decode(token_ids)
             except Exception as e:
-                print(
-                    f"[Warning] Decode failed for token_ids={token_ids}. Set the token to EOS.")
+                print(f"[Warning] Decode failed for token_ids={token_ids}. Set the token to EOS.")
                 token_ids = [self.tokenizer.eos_token_id]
                 text = self.tokenizer.decode(token_ids)
-            safe_outputs.append({"text": text, "token_ids": token_ids, "trajectory": trajectory})
+            safe_outputs.append({
+                "text": text, 
+                "token_ids": token_ids, 
+                "trajectory": trajectory,
+                "logprobs": logprobs,  # NEW
+                "entropies": entropies  # NEW
+            })
+        
         if use_tqdm:
             pbar.close()
         return safe_outputs
@@ -322,8 +338,13 @@ class LLMEngine:
                     {"Throughput": f"{int(throughput)} tok/s"})
                 pbar.update(len(output))
 
-            for seq_id, token_ids, trajectory in output:
-                outputs[seq_id] = {"token_ids": token_ids, "trajectory": trajectory}
+            for seq_id, token_ids, trajectory, logprobs, entropies in output:  # Updated unpacking
+                outputs[seq_id] = {
+                    "token_ids": token_ids, 
+                    "trajectory": trajectory,
+                    "logprobs": logprobs,  # NEW
+                    "entropies": entropies  # NEW
+                }
 
         outputs = [outputs[seq_id] for seq_id in sorted(outputs)]
         
@@ -331,14 +352,21 @@ class LLMEngine:
         for output in outputs:
             token_ids = output["token_ids"]
             trajectory = output["trajectory"]
+            logprobs = output["logprobs"]  # NEW
+            entropies = output["entropies"]  # NEW
             try:
                 text = self.tokenizer.decode(token_ids)
             except Exception as e:
-                print(
-                    f"[Warning] Decode failed for token_ids={token_ids}. Set the token to EOS.")
+                print(f"[Warning] Decode failed for token_ids={token_ids}. Set the token to EOS.")
                 token_ids = [self.tokenizer.eos_token_id]
                 text = self.tokenizer.decode(token_ids)
-            safe_outputs.append({"text": text, "token_ids": token_ids, "trajectory": trajectory})
+            safe_outputs.append({
+                "text": text, 
+                "token_ids": token_ids, 
+                "trajectory": trajectory,
+                "logprobs": logprobs,  # NEW
+                "entropies": entropies  # NEW
+            })
 
         if use_tqdm:
             pbar.close()

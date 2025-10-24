@@ -45,6 +45,13 @@ class Sequence:
         self.block_trajectory: list[int] | None = [0] * len(self.intermediate_block_tokens)
         self.global_denoising_step = 0
         
+        # NEW: Add logprobs and entropies tracking
+        self.logprobs: list[float] = []
+        self.block_logprobs: list[float] | None = [0.0] * len(self.intermediate_block_tokens)
+        
+        self.entropies: list[float] = []
+        self.block_entropies: list[float] | None = [0.0] * len(self.intermediate_block_tokens)
+        
         # initial status based on whether prefill is needed.
         if self.num_prefill_tokens > 0:
             self.status = SequenceStatus.WAITING
@@ -87,6 +94,9 @@ class Sequence:
         self.current_denoising_step = 0
         self.intermediate_block_tokens = [self.mask_token_id] * self.block_length
         self.intermediate_block_tokens_entropy = [0.0] * self.block_length
+        self.block_trajectory = [0] * self.block_length
+        self.block_logprobs = [0.0] * self.block_length
+        self.block_entropies = [0.0] * self.block_length
         self.status = SequenceStatus.DENOISING
 
     def commit_block(self, block_tokens: list[int]):
@@ -114,7 +124,14 @@ class Sequence:
             start = min(block_start, block_len)
             if start < block_len:
                 self.trajectory.extend(self.block_trajectory[start:block_len])
+                if self.block_logprobs is not None:
+                    self.logprobs.extend(self.block_logprobs[start:block_len])
+                if self.block_entropies is not None:
+                    self.entropies.extend(self.block_entropies[start:block_len])
+ 
             self.block_trajectory = None
+            self.block_trajectory = None
+            self.block_logprobs = None
 
         if self.num_tokens >= self.num_prompt_tokens + self.max_tokens:
              self.status = SequenceStatus.FINISHED
