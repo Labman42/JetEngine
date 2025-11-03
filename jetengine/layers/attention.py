@@ -8,7 +8,7 @@ from jetengine.engine.sequence import RunType
 from jetengine.kernels.triton.attention import sparse_attn_varlen
 # from jetengine.kernels.triton.attention import fused_kv_cache_attention
 # from jetengine.kernels.triton.attention import fused_kv_cache_attention_v5
-from flash_attn import flash_attn_with_kvcache
+from flash_attn import flash_attn_with_kvcache, flash_attn_varlen_func
 
 
 @triton.jit
@@ -99,5 +99,45 @@ class BlockAttention(Attention):
                                         causal=False)  # Assuming non-causal for benchmark consistency     
         o = o.view(-1, self.num_heads * self.head_dim)
         return o
+    
+class LladaBlockAttention(Attention):
+    def __init__(
+        self,
+        num_heads,
+        head_dim,
+        scale,
+        num_kv_heads,
+    ):
+        super().__init__(num_heads, head_dim, scale, num_kv_heads)
+    
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        o: torch.Tensor
+        q = q.view(-1, self.num_heads, self.head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        v = v.view(-1, self.num_kv_heads, self.head_dim)
+        context = get_context()
+        k_cache, v_cache = self.k_cache, self.v_cache
+
+        should_store_whole = (context.run_type == RunType.PREFILL)
+        if should_store_whole and k_cache.numel() and v_cache.numel():
+            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+            
+        if context.run_type == RunType.PREFILL:
+            max_seqlen_q = (context.cu_seqlens_q[1:] - context.cu_seqlens_q[:-1]).max().item()
+            max_seqlen_k = (context.cu_seqlens_k[1:] - context.cu_seqlens_k[:-1]).max().item()
+            o = flash_attn_varlen_func(q, k, v,
+                            max_seqlen_q=max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
+                            max_seqlen_k=max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,)
+        else:
+            q = q.view(-1, context.block_length, self.num_heads, self.head_dim)
+            k = k.view(-1, context.block_length, self.num_kv_heads, self.head_dim)
+            v = v.view(-1, context.block_length, self.num_kv_heads, self.head_dim)
+            o = flash_attn_with_kvcache(q, k_cache=k_cache, v_cache=v_cache, k=k, v=v,
+                                        cache_seqlens=context.context_lens,
+                                        block_table=context.block_tables,
+                                        causal=False)  # Assuming non-causal for benchmark consistency     
+        o = o.view(-1, self.num_heads * self.head_dim)
+        return o
+
 
         

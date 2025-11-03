@@ -29,7 +29,8 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(
             config.model, use_fast=True, trust_remote_code=True)
         config.eos = self.tokenizer.eos_token_id
-        config.mask_token_id = self.tokenizer.mask_token_id if self.tokenizer.mask_token_id is not None else self.tokenizer.pad_token_id
+        if config.mask_token_id == -1:
+            config.mask_token_id = self.tokenizer.mask_token_id if self.tokenizer.mask_token_id is not None else self.tokenizer.pad_token_id
         assert config.mask_token_id is not None, "Model tokenizer must have a mask_token_id or pad_token_id"
 
         self.config = config
@@ -117,7 +118,7 @@ class LLMEngine:
 
         try:
             torch.set_default_device("cuda")
-            torch.set_default_dtype(self.config.hf_config.torch_dtype)
+            torch.set_default_dtype(self.config.torch_dtype)
 
             self.model_runner.reinit_model()
             # print("Created new model shell.")
@@ -153,6 +154,8 @@ class LLMEngine:
             if self.tokenizer.pad_token_id in prompt:
                 start = prompt.index(self.tokenizer.pad_token_id) + 1
                 prompt = prompt[start:]
+        if sampling_params.stop_words is None:
+            sampling_params.stop_words = [self.tokenizer.eos_token_id]
         seq = Sequence(prompt, self.config.mask_token_id, sampling_params)
         seq.eos_token_id = self.tokenizer.eos_token_id
         self.scheduler.add(seq)
@@ -320,7 +323,7 @@ class LLMEngine:
                 deficit -= 1
 
             output, num_processed = self.step()
-            
+
             if not output and not self.is_finished() and num_processed == 0 and pending_idx == total:
                 stall_counter += 1
                 if stall_counter > 3:
@@ -328,7 +331,7 @@ class LLMEngine:
                     break
             else:
                 stall_counter = 0
-                
+            
             total_generated_tokens += num_processed
 
             if use_tqdm:

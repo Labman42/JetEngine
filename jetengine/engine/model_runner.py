@@ -7,6 +7,7 @@ from jetengine.config import Config
 from jetengine.engine.sequence import Sequence, RunType, SequenceStatus
 from jetengine.models.sdar import SDARForCausalLM
 from jetengine.models.sdar_moe import SDARMoeForCausalLM
+from jetengine.models.llada import LladaForCausalLM
 from jetengine.utils.context import set_context, get_context, reset_context
 from jetengine.utils.loader import load_model
 from jetengine.engine.distributed_manager import DistributedManager
@@ -26,7 +27,7 @@ class ModelRunner:
 
         torch.cuda.set_device(dist_manager.device)
         default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.torch_dtype)
+        torch.set_default_dtype(config.torch_dtype)
         torch.set_default_device("cuda")
 
         model_kwargs = {"config": hf_config,
@@ -36,6 +37,8 @@ class ModelRunner:
             self.ModelClass = SDARMoeForCausalLM
         elif "sdar" in hf_config.model_type:
             self.ModelClass = SDARForCausalLM
+        elif "llada" in hf_config.model_type.lower():  # <-- ADD THIS BLOCK
+            self.ModelClass = LladaForCausalLM
         else:
             raise ValueError(f"Unsupported model type: {hf_config.model_type}")
         self.model = self.ModelClass(**model_kwargs)
@@ -77,14 +80,14 @@ class ModelRunner:
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * \
-            num_kv_heads * hf_config.head_dim * hf_config.torch_dtype.itemsize
+        num_kv_heads = config.num_key_value_heads // self.world_size
+        block_bytes = 2 * config.num_hidden_layers * self.block_size * \
+            num_kv_heads * config.head_dim * config.torch_dtype.itemsize
         config.num_kvcache_blocks = int(
             total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.zeros(2, hf_config.num_hidden_layers, config.num_kvcache_blocks,
-                                    self.block_size, num_kv_heads, hf_config.head_dim)
+        self.kv_cache = torch.zeros(2, config.num_hidden_layers, config.num_kvcache_blocks,
+                                    self.block_size, num_kv_heads, config.head_dim)
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
@@ -98,8 +101,8 @@ class ModelRunner:
             return None
         block_tables = [seq.block_table + [-1] *
                         (max_len - len(seq.block_table)) for seq in seqs]
-        return torch.tensor(block_tables, dtype=torch.int32).cuda()
-
+        block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        return block_tables
     def prepare_prefill_loop(self, seqs: list[Sequence]):
         input_ids, positions, cu_seqlens_q, slot_mapping, is_last_step = [], [], [0], [], []
         max_seqlen_q = 0
@@ -324,7 +327,7 @@ class ModelRunner:
         positions = torch.zeros(max_global_bs, dtype=torch.int64)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
-        outputs = torch.zeros(max_global_bs, hf_config.hidden_size)
+        outputs = torch.zeros(max_global_bs, config.hidden_size)
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
         self.graph_pool = None

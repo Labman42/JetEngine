@@ -61,6 +61,7 @@ class Sequence:
         # Block Diffusion parameters
         self.temperature = sampling_params.temperature
         self.stop_words = sampling_params.stop_words if sampling_params.stop_words is not None else []
+        self.stop_words = set(self.stop_words)
         self.top_k = sampling_params.topk
         self.top_p = sampling_params.topp
         self.max_tokens = sampling_params.max_tokens
@@ -102,8 +103,14 @@ class Sequence:
     def commit_block(self, block_tokens: list[int]):
         # Trim block if it exceeds max_tokens or contains EOS
         final_block = []
-        for token_id in block_tokens:
-            if not self.ignore_eos and (token_id == self.eos_token_id or token_id in self.stop_words):
+        for i, token_id in enumerate(block_tokens):
+            # if token_id == 151670:
+            #     print("[Warning]: no <im_end> before the <|PAD|>, ", block_tokens)
+            #     block_tokens[i] = 151645
+            #     final_block.append(token_id)
+            #     self.status = SequenceStatus.FINISHED
+            #     break
+            if not self.ignore_eos and (token_id in self.stop_words):
                 final_block.append(token_id)
                 self.status = SequenceStatus.FINISHED
                 break
@@ -129,7 +136,6 @@ class Sequence:
                 if self.block_entropies is not None:
                     self.entropies.extend(self.block_entropies[start:block_len])
  
-            self.block_trajectory = None
             self.block_trajectory = None
             self.block_logprobs = None
 

@@ -35,6 +35,7 @@ class Scheduler:
 
     def schedule(self) -> tuple[list[Sequence], RunType] | tuple[None, None]:
         # 1. Schedule new sequences for prefill
+        self.running = [s for s in self.running if not s.is_finished]
         prefill_candidates = [s for s in self.running if s.status == SequenceStatus.WAITING]
         if prefill_candidates:
             prefill_batch = []
@@ -56,9 +57,14 @@ class Scheduler:
                 if len(denoise_batch) < self.max_num_seqs and self.block_manager.can_append_blocks(num_new_blocks):
                     self.block_manager.append_blocks(seq, num_new_blocks)
                     denoise_batch.append(seq)
+                else:
+                    print(f"[Warning] Can not denoise seq with {len(seq)} and block_manager with {self.block_manager.free_block_ids}")
             if denoise_batch:
                 return denoise_batch, RunType.DENOISE
-
+        left = len(self.running)
+        if left > 0:
+            print("[Warning] No progress can be made .")
+            print(f"[Warning]: Left {left}")
         return None, None     
 
     def postprocess_loop(self, seqs: list[Sequence], logits: torch.Tensor, run_type: RunType):
@@ -329,22 +335,44 @@ class Scheduler:
                 num_transferred_dyn = dyn_transfer_index.sum(dim=1)
                 needs_fallback = (num_transferred_dyn < batch_num_to_transfer) & low_conf_dynamic_mask.squeeze()
                 
+                # if needs_fallback.any():
+                #     # Get max K for only the sequences that need fallback
+                #     fallback_k_values = batch_num_to_transfer[needs_fallback]
+                #     max_k_dyn = fallback_k_values.max().item()
+                    
+                #     # Get top-k for *only* the fallback sequences
+                #     _, top_indices_dyn = torch.topk(confidence[needs_fallback], k=max_k_dyn, dim=1)
+                    
+                #     # Create the K-mask for the fallback sequences
+                #     k_mask_dyn = torch.arange(max_k_dyn, device=device).unsqueeze(0) < fallback_k_values.unsqueeze(1)
+                    
+                #     # Scatter to create the new transfer indices for fallback sequences
+                #     fallback_indices = torch.zeros((needs_fallback.sum(), block_len), dtype=torch.bool, device=device)
+                #     fallback_indices.scatter_(1, top_indices_dyn, k_mask_dyn)
+                    
+                #     # *Replace* the indices for the fallback sequences (as per original logic)
+                #     dyn_transfer_index[needs_fallback] = fallback_indices
+                
                 if needs_fallback.any():
-                    # Get max K for only the sequences that need fallback
-                    fallback_k_values = batch_num_to_transfer[needs_fallback]
-                    max_k_dyn = fallback_k_values.max().item()
+                    # Get the tensors for *only* the fallback sequences
+                    fallback_mask_token_mask = mask_token_mask[needs_fallback]  # (num_fallback, L)
+                    fallback_num_to_transfer = batch_num_to_transfer[needs_fallback].unsqueeze(1) # (num_fallback, 1)
+
+                    # Find the first mask position for each *fallback* sequence
+                    first_mask_pos = torch.argmax(fallback_mask_token_mask.int(), dim=1, keepdim=True) # (num_fallback, 1)
                     
-                    # Get top-k for *only* the fallback sequences
-                    _, top_indices_dyn = torch.topk(confidence[needs_fallback], k=max_k_dyn, dim=1)
+                    # Create a range tensor [0, 1, ..., L-1]
+                    range_tensor = torch.arange(block_len, device=device).unsqueeze(0) # (1, L)
                     
-                    # Create the K-mask for the fallback sequences
-                    k_mask_dyn = torch.arange(max_k_dyn, device=device).unsqueeze(0) < fallback_k_values.unsqueeze(1)
+                    # Create start and end transfer positions for each *fallback* sequence
+                    start_pos_b = first_mask_pos
+                    end_pos_b = (start_pos_b + fallback_num_to_transfer).clamp_max(block_len)
                     
-                    # Scatter to create the new transfer indices for fallback sequences
-                    fallback_indices = torch.zeros((needs_fallback.sum(), block_len), dtype=torch.bool, device=device)
-                    fallback_indices.scatter_(1, top_indices_dyn, k_mask_dyn)
+                    # Create the transfer mask for the *fallback* sequences
+                    # Ensure we only select actual mask tokens within the sequential range
+                    fallback_indices = (range_tensor >= start_pos_b) & (range_tensor < end_pos_b) & fallback_mask_token_mask
                     
-                    # *Replace* the indices for the fallback sequences (as per original logic)
+                    # *Replace* the threshold-based indices with the new sequential indices
                     dyn_transfer_index[needs_fallback] = fallback_indices
                 
                 # Update the batch_num_to_transfer tensor for sequences that used this strategy
@@ -423,12 +451,10 @@ class Scheduler:
             # Check for finished blocks
             is_fully_denoised = (~(batch_new_tokens == self.mask_token_id).any(dim=1)) | \
                                 (new_denoising_steps >= torch.tensor([seq.denoising_steps for seq in seqs], device=device))
-            
-            is_finished_flags = torch.tensor([seq.is_finished for seq in seqs], device=device)
 
             # --- 6. Lightweight Disaggregation Loop ---
             # This loop is now very fast, just for updating Python object state.
-            
+
             for i, seq in enumerate(seqs):
                 if denoising_mask_bool[i]:
                     # Update sequence state from the computed batch tensors
@@ -449,7 +475,7 @@ class Scheduler:
                     
                     # Check if block is done
                     if is_fully_denoised[i]:
-                        seq.status = SequenceStatus.FINISHED if is_finished_flags[i] else SequenceStatus.SAVING
+                        seq.status = SequenceStatus.SAVING
 
                 elif saving_mask_bool[i]:
                     # This part remains the same, as it's state-machine logic
@@ -457,9 +483,11 @@ class Scheduler:
                     seq.num_to_transfer = 0
                     if not seq.is_finished:
                         seq.start_new_block()
+                    else:
+                        self.block_manager.deallocate(seq)
                         
-        # Filter out finished sequences from the running list
-        finished_seqs = [seq for seq in self.running if seq.is_finished]
-        self.running = [seq for seq in self.running if not seq.is_finished]
-        for seq in finished_seqs:
-            self.block_manager.deallocate(seq)
+        # # Filter out finished sequences from the running list
+        # finished_seqs = [seq for seq in self.running if seq.is_finished]
+        # self.running = [seq for seq in self.running if not seq.is_finished]
+        # for seq in finished_seqs:
+        #     self.block_manager.deallocate(seq)

@@ -207,7 +207,10 @@ def load_from_hf_model(target_model: nn.Module, hf_model: nn.Module):
             # Handle fused gate_up_proj (non-MoE)
             elif 'gate_up_proj.weight' in name and 'experts.' not in name:
                 base_name = name.replace('gate_up_proj.weight', '')
-                gate_name = base_name + 'gate_proj.weight'
+                if "llada" in hf_model.__class__.__name__.lower():
+                    gate_name = base_name + 'ff_proj.weight'
+                else:
+                    gate_name = base_name + 'gate_proj.weight'
                 up_name = base_name + 'up_proj.weight'
 
                 try:
