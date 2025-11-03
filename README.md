@@ -10,7 +10,7 @@ This demonstrates that JetEngine can unlock production-level throughput for SDAR
 ## 🚀 New Features
 [11/03/2025] Support LLaDa
 
-> [LLaDa output Example](./assests/llada_example.png)
+> ![LLaDa output Example](./assets/llada_example.png)
 
 ```python
 
