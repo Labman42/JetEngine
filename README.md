@@ -29,6 +29,8 @@ In our benchmark, we tested the 4B SDAR model with block size 4 (basic accelerat
 
 This demonstrates that JetEngine can unlock production-level throughput for SDAR models, making it ideal for both research-scale batch inference and real-world deployment scenarios.
 ## 🚀 New Features
+[11/03/2025] Support Llada in a very interesting way, please check the `accelerate` branch
+
 [09/15/2025] Support completely offload the model and kv cache to free memory for RL training
 
 [09/14/2025] Support Hybrid Data Parallel and Tensor Parallel Inference
