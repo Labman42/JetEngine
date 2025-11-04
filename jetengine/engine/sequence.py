@@ -30,6 +30,7 @@ class Sequence:
         prefill_part = self.prompt_token_ids[:self.num_prefill_tokens]
         
         first_denoise_part = self.prompt_token_ids[self.num_prefill_tokens:]
+        self.generation_start_index = len(first_denoise_part)
         
         self.token_ids = prefill_part
         self.num_tokens = len(self.token_ids)
@@ -103,14 +104,10 @@ class Sequence:
     def commit_block(self, block_tokens: list[int]):
         # Trim block if it exceeds max_tokens or contains EOS
         final_block = []
-        for i, token_id in enumerate(block_tokens):
-            # if token_id == 151670:
-            #     print("[Warning]: no <im_end> before the <|PAD|>, ", block_tokens)
-            #     block_tokens[i] = 151645
-            #     final_block.append(token_id)
-            #     self.status = SequenceStatus.FINISHED
-            #     break
-            if not self.ignore_eos and (token_id in self.stop_words):
+        for i in range(self.generation_start_index, len(block_tokens)):
+            token_id = block_tokens[i]
+            # specify where to start generating within the first decoding block
+            if (not self.ignore_eos) and (token_id in self.stop_words):
                 final_block.append(token_id)
                 self.status = SequenceStatus.FINISHED
                 break
@@ -118,6 +115,7 @@ class Sequence:
                 self.status = SequenceStatus.FINISHED
                 break
             final_block.append(token_id)
+        self.generation_start_index = 0  # after the first decoding block
             
         before_ntok = self.num_tokens
         self.token_ids.extend(block_tokens)

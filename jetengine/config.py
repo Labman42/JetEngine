@@ -15,7 +15,7 @@ def get_cfg_alias(cfg, name, *candidates):
 class Config:
     model: str
     max_num_batched_tokens: int = 16384
-    max_num_seqs: int = 32
+    max_num_seqs: int = 128
     max_model_len: int = 2048
     gpu_memory_utilization: float = 0.8
     tensor_parallel_size: int = 1
