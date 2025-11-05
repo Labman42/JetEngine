@@ -1,3 +1,4 @@
+import math
 import pickle
 import os
 import torch
@@ -126,10 +127,16 @@ class ModelRunner:
                 slot = physical_block_id * self.block_size + block_offset
                 slot_mapping.append(slot)
 
-        input_ids = torch.tensor(input_ids, dtype=torch.int64).cuda()
-        positions = torch.tensor(positions, dtype=torch.int64).cuda()
-        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32).cuda()
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32).cuda()
+        device = torch.device("cuda")
+        input_ids_cpu = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True)
+        positions_cpu = torch.tensor(positions, dtype=torch.int64, pin_memory=True)
+        cu_seqlens_q_cpu = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True)
+        slot_mapping_cpu = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True)
+
+        input_ids = input_ids_cpu.to(device=device, non_blocking=True)
+        positions = positions_cpu.to(device=device, non_blocking=True)
+        cu_seqlens_q = cu_seqlens_q_cpu.to(device=device, non_blocking=True)
+        slot_mapping = slot_mapping_cpu.to(device=device, non_blocking=True)
         set_context(
             run_type=RunType.PREFILL,
             cu_seqlens_q=cu_seqlens_q,
@@ -163,27 +170,36 @@ class ModelRunner:
                 block_table_lens_list.append(0)
         
         # (total_tokens,)
-        input_ids = torch.tensor(all_token_ids_flat, dtype=torch.int64, device=device)
+        input_ids_cpu = torch.tensor(all_token_ids_flat, dtype=torch.int64, pin_memory=True)
+        input_ids = input_ids_cpu.to(device=device, non_blocking=True)
         
         # (total_physical_blocks,)
-        flat_block_tables = torch.tensor(
-            all_block_tables_flat, dtype=torch.int32, device=device
+        flat_block_tables_cpu = torch.tensor(
+            all_block_tables_flat, dtype=torch.int32, pin_memory=True
         )
+        flat_block_tables = flat_block_tables_cpu.to(device=device, non_blocking=True)
         
         # (B,)
-        seqlens_q = torch.tensor(seqlens_list, dtype=torch.int32, device=device)
-        block_table_lens = torch.tensor(
-            block_table_lens_list, dtype=torch.int32, device=device
+        seqlens_q_cpu = torch.tensor(seqlens_list, dtype=torch.int32, pin_memory=True)
+        block_table_lens_cpu = torch.tensor(
+            block_table_lens_list, dtype=torch.int32, pin_memory=True
         )
-        is_last_step = torch.tensor(is_last_step_list, dtype=torch.bool, device=device)
+        is_last_step_cpu = torch.tensor(is_last_step_list, dtype=torch.bool, pin_memory=True)
+
+        seqlens_q = seqlens_q_cpu.to(device=device, non_blocking=True)
+        block_table_lens = block_table_lens_cpu.to(device=device, non_blocking=True)
+        is_last_step = is_last_step_cpu.to(device=device, non_blocking=True)
         
         batch_size = len(seqs)
         if batch_size == 0:
             # Handle empty batch case
-            cu_seqlens_q = torch.tensor([0], dtype=torch.int32, device=device)
+            cu_seqlens_q_cpu = torch.tensor([0], dtype=torch.int32, pin_memory=True)
+            cu_seqlens_q = cu_seqlens_q_cpu.to(device=device, non_blocking=True)
             max_seqlen_q = 0
-            positions = torch.empty(0, dtype=torch.int64, device=device)
-            slot_mapping = torch.empty(0, dtype=torch.int32, device=device)
+            positions_cpu = torch.empty(0, dtype=torch.int64, pin_memory=True)
+            slot_mapping_cpu = torch.empty(0, dtype=torch.int32, pin_memory=True)
+            positions = positions_cpu.to(device=device, non_blocking=True)
+            slot_mapping = slot_mapping_cpu.to(device=device, non_blocking=True)
         else:
             # (B+1,)
             cu_seqlens_q = torch.nn.functional.pad(
@@ -249,9 +265,14 @@ class ModelRunner:
             positions.extend(range(k_len, k_len + q_len))
             cached_lens.append(k_len)
 
-        input_ids = torch.tensor(input_ids, dtype=torch.int64).cuda()
-        positions = torch.tensor(positions, dtype=torch.int64).cuda()
-        cached_lens = torch.tensor(cached_lens, dtype=torch.int32).cuda()
+        device = torch.device("cuda")
+        input_ids_cpu = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True)
+        positions_cpu = torch.tensor(positions, dtype=torch.int64, pin_memory=True)
+        cached_lens_cpu = torch.tensor(cached_lens, dtype=torch.int32, pin_memory=True)
+
+        input_ids = input_ids_cpu.to(device=device, non_blocking=True)
+        positions = positions_cpu.to(device=device, non_blocking=True)
+        cached_lens = cached_lens_cpu.to(device=device, non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
 
         set_context(
@@ -266,18 +287,20 @@ class ModelRunner:
     def prepare_denoise(self, seqs: list[Sequence]):
         block_len = len(seqs[0].intermediate_block_tokens)
         device = torch.device("cuda")
-        cached_lens = torch.tensor(
+        cached_lens_cpu = torch.tensor(
             [len(seq) for seq in seqs], 
             dtype=torch.int32, 
-            device=device
+            pin_memory=True
         )
+        cached_lens = cached_lens_cpu.to(device=device, non_blocking=True)
         
         input_ids_list = [seq.intermediate_block_tokens for seq in seqs]
-        input_ids = torch.tensor(
+        input_ids_cpu = torch.tensor(
             input_ids_list, 
             dtype=torch.int64, 
-            device=device
+            pin_memory=True
         ).view(-1) # Flatten to (B * L,)
+        input_ids = input_ids_cpu.to(device=device, non_blocking=True)
 
         start_positions = cached_lens.unsqueeze(1)
         offsets = torch.arange(
@@ -303,6 +326,73 @@ class ModelRunner:
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor):
         return self.model.compute_logits(self.model(input_ids, positions))
 
+    @torch.inference_mode()
+    def _run_denoise_with_cudagraph(
+        self,
+        seqs: list[Sequence],
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, bool]:
+        if (
+            self.enforce_eager
+            or not hasattr(self, "graphs")
+            or not getattr(self, "graphs", None)
+        ):
+            return None, False
+
+        context = get_context()
+        if context.run_type != RunType.DENOISE:
+            return None, False
+
+        batch_size = len(seqs)
+        if batch_size == 0:
+            return None, False
+
+        graph = self.graphs.get(batch_size)
+        if graph is None:
+            return None, False
+
+        graph_vars = self.graph_vars
+        block_len = self.config.block_length
+        global_bs = batch_size * block_len
+
+        if (
+            global_bs > graph_vars["input_ids"].shape[0]
+            or context.context_lens is None
+        ):
+            return None, False
+
+        graph_vars["input_ids"][:global_bs].copy_(input_ids)
+        graph_vars["positions"][:global_bs].copy_(positions)
+        graph_context_lens = graph_vars["context_lens"][:batch_size]
+        graph_context_lens.copy_(context.context_lens)
+
+        graph_block_tables = graph_vars["block_tables"][:batch_size]
+        graph_block_tables.fill_(-1)
+        if context.block_tables is not None:
+            required_blocks = context.block_tables.shape[1]
+            if required_blocks > graph_block_tables.shape[1]:
+                if self.rank == 0:
+                    print(
+                        "[CUDAGraph] Block table requirement exceeds captured capacity; "
+                        "falling back to eager execution."
+                    )
+                return None, False
+            graph_block_tables[:, :required_blocks].copy_(context.block_tables)
+
+        set_context(
+            run_type=RunType.DENOISE,
+            context_lens=graph_context_lens,
+            block_tables=graph_block_tables,
+            block_length=self.config.block_length,
+            is_last_denoise_step=context.is_last_denoise_step,
+        )
+
+        graph.replay()
+        hidden_states = graph_vars["outputs"][:global_bs]
+        logits = self.model.compute_logits(hidden_states)
+        return logits, True
+
     def run(self, seqs: list[Sequence], run_type: RunType) -> torch.Tensor:
         if run_type == RunType.PREFILL:
             input_ids, positions = self.prepare_prefill(seqs)
@@ -311,23 +401,32 @@ class ModelRunner:
         else:
             return None
 
-        logits = self.run_model(input_ids, positions)
+        if run_type == RunType.DENOISE and not self.enforce_eager:
+            logits, used_graph = self._run_denoise_with_cudagraph(
+                seqs, input_ids, positions
+            )
+            if not used_graph:
+                logits = self.run_model(input_ids, positions)
+        else:
+            logits = self.run_model(input_ids, positions)
         reset_context()
         return logits if self.rank == 0 else None
 
     @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config
-        hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 256)
         max_global_bs = max_bs * self.config.block_length
-        max_num_blocks = (config.max_model_len +
-                          self.block_size - 1) // self.block_size
+        max_num_blocks = math.ceil(
+            (config.max_model_len + self.config.block_length) / self.block_size
+        ) + 1
         input_ids = torch.zeros(max_global_bs, dtype=torch.int64)
         positions = torch.zeros(max_global_bs, dtype=torch.int64)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
-        outputs = torch.zeros(max_global_bs, config.hidden_size)
+        outputs = torch.zeros(
+            max_global_bs, config.hidden_size, dtype=config.torch_dtype
+        )
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
         self.graph_pool = None

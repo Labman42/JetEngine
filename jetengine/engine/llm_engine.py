@@ -1,4 +1,5 @@
 import atexit
+import math
 from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
@@ -16,12 +17,38 @@ from jetengine.utils.loader import load_from_hf_model
 from jetengine.engine.distributed_manager import DistributedManager
 
 
+def _estimate_kv_cache_usage(config: Config) -> tuple[int, int]:
+    tokens_per_sequence = config.max_model_len
+    blocks_per_sequence = math.ceil(tokens_per_sequence / config.kvcache_block_size)
+    total_blocks = blocks_per_sequence * config.max_num_seqs
+
+    num_kv_heads = config.num_key_value_heads // config.tensor_parallel_size
+    block_bytes = (
+        2
+        * config.num_hidden_layers
+        * config.kvcache_block_size
+        * num_kv_heads
+        * config.head_dim
+        * config.torch_dtype.itemsize
+    )
+    total_bytes = total_blocks * block_bytes
+    return total_blocks, total_bytes
+
+
 class LLMEngine:
 
     def __init__(self, model, **kwargs):
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+
+        est_blocks, est_bytes = _estimate_kv_cache_usage(config)
+        est_gib = est_bytes / (1024 ** 3)
+        print(
+            f"[KVCache] Estimating {est_blocks:,} blocks "
+            f"({est_gib:.2f} GiB) for up to {config.max_num_seqs:,} active sequences "
+            f"of length {config.max_model_len:,} tokens."
+        )
 
         self.dist_manager = DistributedManager(config.tensor_parallel_size)
 
@@ -35,7 +62,7 @@ class LLMEngine:
 
         self.config = config
         self.scheduler = Scheduler(config)
-        self.scheduler.consistent_sampling_params = True
+        self.scheduler.consistent_sampling_params = False
         atexit.register(self.exit)
 
     def offload_parameters(self, include_buffers: bool = False):
@@ -161,40 +188,56 @@ class LLMEngine:
         self.scheduler.add(seq)
 
     def step(self):
-        scheduled_seqs, run_type = self.scheduler.schedule()
-        if scheduled_seqs is None:
+        schedule_result = self.scheduler.schedule()
+        if not schedule_result.has_work:
             return [], 0  # Nothing to run
 
-        logits = self.model_runner.run(scheduled_seqs, run_type)
-        self.scheduler.postprocess(scheduled_seqs, logits, run_type)
-        finished_outputs = []
-        for seq in scheduled_seqs:
-            if seq.is_finished:
-                if self.config.max_model_len:
-                    seq.token_ids = seq.token_ids[:self.config.max_model_len]
-                    response_len = min(
-                        self.config.max_model_len - len(seq.prompt_token_ids), len(seq.completion_token_ids))
-                    
-                    seq.trajectory = seq.trajectory[:response_len]
-                    seq.logprobs = seq.logprobs[:response_len]
-                    seq.entropies = seq.entropies[:response_len]
-                # print("jetengine trajectory", len(
-                #     seq.trajectory), seq.trajectory)
-                finished_outputs.append((
-                    seq.seq_id, 
-                    seq.token_ids, 
-                    seq.trajectory,
-                    seq.logprobs,  # NEW
-                    seq.entropies  # NEW
-                ))
-                            
-        # finished_outputs = [(seq.seq_id, seq.completion_token_ids, seq.trajectory[:len(seq.completion_token_ids)])
-        #                     for seq in scheduled_seqs if seq.is_finished]
+        finished_sequences: list[Sequence] = []
+        postprocess_fn = (
+            self.scheduler.postprocess_unify
+            if getattr(self.scheduler, "consistent_sampling_params", False)
+            else self.scheduler.postprocess
+        )
 
-        # Throughput calculation needs to be adapted for block-wise generation
-        num_tokens = [self.scheduler.running[i].num_to_transfer if hasattr(
-            self.scheduler.running[i], 'num_to_transfer') else 0 for i in range(len(self.scheduler.running))]
-        return finished_outputs, sum(num_tokens)
+        if schedule_result.prefill:
+            logits = self.model_runner.run(schedule_result.prefill, RunType.PREFILL)
+            finished_sequences.extend(
+                postprocess_fn(schedule_result.prefill, logits, RunType.PREFILL)
+            )
+
+        tokens_generated = 0
+        if schedule_result.denoise:
+            logits = self.model_runner.run(schedule_result.denoise, RunType.DENOISE)
+            finished_sequences.extend(
+                postprocess_fn(schedule_result.denoise, logits, RunType.DENOISE)
+            )
+            tokens_generated = sum(
+                getattr(seq, "num_to_transfer", 0) for seq in schedule_result.denoise
+            )
+
+        # Deduplicate by sequence id to avoid returning the same sequence twice
+        seen_seq_ids = set()
+        finished_outputs = []
+        for seq in finished_sequences:
+            if seq.seq_id in seen_seq_ids:
+                continue
+            seen_seq_ids.add(seq.seq_id)
+
+            if self.config.max_model_len:
+                seq.token_ids = seq.token_ids[:self.config.max_model_len]
+                response_len = min(
+                    self.config.max_model_len - len(seq.prompt_token_ids),
+                    len(seq.completion_token_ids),
+                )
+                seq.trajectory = seq.trajectory[:response_len]
+                seq.logprobs = seq.logprobs[:response_len]
+                seq.entropies = seq.entropies[:response_len]
+
+            finished_outputs.append(
+                (seq.seq_id, seq.token_ids, seq.trajectory, seq.logprobs, seq.entropies)
+            )
+
+        return finished_outputs, tokens_generated
 
     def is_finished(self):
         return self.scheduler.is_finished()
@@ -336,7 +379,7 @@ class LLMEngine:
 
             if use_tqdm:
                 throughput = total_generated_tokens / \
-                    (perf_counter() - start_time + 1e-6)
+                    (perf_counter() - start_time)
                 pbar.set_postfix(
                     {"Throughput": f"{int(throughput)} tok/s"})
                 pbar.update(len(output))

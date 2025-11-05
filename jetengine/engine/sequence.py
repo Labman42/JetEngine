@@ -17,11 +17,14 @@ class RunType(Enum):
 
 
 class Sequence:
-    block_size = 256
+    default_block_size = 256
+    block_size = default_block_size
     counter = count()
 
-    def __init__(self, prompt_token_ids: list[int], mask_token_id: int, sampling_params=SamplingParams()):
+    def __init__(self, prompt_token_ids: list[int], mask_token_id: int, sampling_params=SamplingParams(), block_size: int | None = None):
         self.seq_id = next(Sequence.counter)
+        if block_size is not None:
+            self.block_size = block_size
         self.block_length = sampling_params.block_length
         self.prompt_token_ids = prompt_token_ids
         prompt_len = len(self.prompt_token_ids)
@@ -103,18 +106,44 @@ class Sequence:
 
     def commit_block(self, block_tokens: list[int]):
         # Trim block if it exceeds max_tokens or contains EOS
-        final_block = []
-        for i in range(self.generation_start_index, len(block_tokens)):
-            token_id = block_tokens[i]
-            # specify where to start generating within the first decoding block
-            if (not self.ignore_eos) and (token_id in self.stop_words):
-                final_block.append(token_id)
-                self.status = SequenceStatus.FINISHED
-                break
-            if self.num_completion_tokens + len(final_block) >= self.max_tokens:
-                self.status = SequenceStatus.FINISHED
-                break
-            final_block.append(token_id)
+        # final_block = []
+        # for i in range(self.generation_start_index, len(block_tokens)):
+        #     token_id = block_tokens[i]
+        #     # specify where to start generating within the first decoding block
+        #     if (not self.ignore_eos) and (token_id in self.stop_words):
+        #         final_block.append(token_id)
+        #         self.status = SequenceStatus.FINISHED
+        #         break
+        #     if self.num_completion_tokens + len(final_block) >= self.max_tokens:
+        #         self.status = SequenceStatus.FINISHED
+        #         break
+        #     final_block.append(token_id)
+            
+        start = self.generation_start_index
+        # how many tokens we're still allowed to emit
+        remaining = self.max_tokens - self.num_completion_tokens
+        if remaining <= 0:
+            self.status = SequenceStatus.FINISHED
+            return []
+
+        # find earliest stop position (inclusive of the stop token)
+        stop_pos = None
+        if (not self.ignore_eos) and self.stop_words:
+            # find the first index j >= start with block_tokens[j] in stop_words
+            stop_pos = next(
+                (j for j, tok in enumerate(block_tokens[start:], start)
+                if tok in self.stop_words),
+                None
+            )
+
+        # compute cut by limits
+        end_by_tokens = start + remaining
+        end_by_stop = (stop_pos + 1) if stop_pos is not None else len(block_tokens)
+        end = min(len(block_tokens), end_by_tokens, end_by_stop)
+
+        # mirror original semantics: FINISHED if stopped by limit or stop token
+        if end == end_by_tokens or (stop_pos is not None and end == stop_pos + 1):
+            self.status = SequenceStatus.FINISHED
         self.generation_start_index = 0  # after the first decoding block
             
         before_ntok = self.num_tokens
@@ -192,10 +221,25 @@ class Sequence:
 
     def __getstate__(self):
         # Simplified for multiprocessing; customize as needed
-        return (self.seq_id, self.status, self.token_ids, self.num_tokens, self.num_prompt_tokens, 
-                self.num_cached_tokens, self.block_table, self.intermediate_block_tokens, self.current_denoising_step)
-
+        return (
+            self.seq_id,
+            self.status,
+            self.token_ids,
+            self.num_tokens,
+            self.num_prompt_tokens,
+            self.num_cached_tokens,
+            self.block_table,
+            self.intermediate_block_tokens,
+            self.current_denoising_step,
+            self.block_size,
+        )
     def __setstate__(self, state):
-        (self.seq_id, self.status, self.token_ids, self.num_tokens, self.num_prompt_tokens, 
-         self.num_cached_tokens, self.block_table, self.intermediate_block_tokens, self.current_denoising_step) = state
-
+        if len(state) == 9:
+            (self.seq_id, self.status, self.token_ids, self.num_tokens, self.num_prompt_tokens,
+             self.num_cached_tokens, self.block_table, self.intermediate_block_tokens,
+             self.current_denoising_step) = state
+            self.block_size = Sequence.default_block_size
+        else:
+            (self.seq_id, self.status, self.token_ids, self.num_tokens, self.num_prompt_tokens,
+             self.num_cached_tokens, self.block_table, self.intermediate_block_tokens,
+             self.current_denoising_step, self.block_size) = state
