@@ -38,6 +38,7 @@ class Sequence:
         self.token_ids = prefill_part
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = prompt_len # Keep track of the original full prompt length
+        self.num_generated_tokens = self.num_tokens - self.num_prompt_tokens
         
         self.intermediate_block_tokens = first_denoise_part + [mask_token_id] * (self.block_length - len(first_denoise_part))
         self.intermediate_block_tokens_entropy = [0.0] * self.block_length
@@ -149,6 +150,7 @@ class Sequence:
         before_ntok = self.num_tokens
         self.token_ids.extend(block_tokens)
         self.num_tokens = len(self.token_ids)
+        self.num_generated_tokens = self.num_tokens - self.num_prompt_tokens
         self.intermediate_block_tokens = []
         self.intermediate_block_tokens_entropy =[]
         

@@ -195,6 +195,7 @@ class LLMEngine:
         finished_sequences: list[Sequence] = []
         postprocess_fn = (
             self.scheduler.postprocess_unify
+            # self.scheduler.postprocess
             if getattr(self.scheduler, "consistent_sampling_params", False)
             else self.scheduler.postprocess
         )

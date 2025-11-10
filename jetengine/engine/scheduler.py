@@ -31,6 +31,8 @@ class Scheduler:
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
         self.mask_token_id = config.mask_token_id
+        self.diversity_enforce = config.diversity_enforce
+        self.barrier = config.diversity_enforce_barrier
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.running: list[Sequence] = []
         self.waiting_prefill: deque[Sequence] = deque()
@@ -515,6 +517,9 @@ class Scheduler:
 
             # Strategy masks
             strategies = [seq.remasking_strategy if status == SequenceStatus.DENOISING else '' for seq, status in zip(seqs, all_statuses)]
+            # Overwrite Strategy
+            if self.diversity_enforce:
+                strategies = [strategy if seq.num_generated_tokens > self.barrier else 'sequential' for strategy, seq in zip(strategies, seqs)]
             seq_mask = torch.tensor([s == 'sequential' for s in strategies], device=device).unsqueeze(1)
             low_conf_static_mask = torch.tensor(['low_confidence_static' in s for s in strategies], device=device).unsqueeze(1)
             low_conf_dynamic_mask = torch.tensor(['low_confidence_dynamic' in s for s in strategies], device=device).unsqueeze(1)
