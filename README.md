@@ -8,6 +8,21 @@ In our benchmark, we tested the 4B SDAR model with block size 4 (basic accelerat
 
 This demonstrates that JetEngine can unlock production-level throughput for SDAR models, making it ideal for both research-scale batch inference and real-world deployment scenarios.
 ## 🚀 New Features
+[11/04/2025] Support dllm-Var
+
+> ![dLLM-Var output Example](./assets/dllmvar_example.png)
+
+```python
+
+path = os.path.expanduser("dLLM-Var")
+tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+# Llada use 126336 as mask token
+llm = LLM(path, enforce_eager=False, tensor_parallel_size=1, mask_token_id=126336, block_length=64, gpu_memory_utilization=0.9) # Must set mask_token_id & block_length
+sampling_params = SamplingParams(temperature=1.0, topk=0, topp=1.0, max_tokens=2048,
+                                 remasking_strategy="low_confidence_dynamic", block_length=64, denoising_steps=64, dynamic_threshold=0.90)
+```
+
+
 [11/03/2025] Support LLaDa
 
 > ![LLaDa output Example](./assets/llada_example.png)
