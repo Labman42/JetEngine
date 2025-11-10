@@ -67,7 +67,7 @@ transformers>=4.52.4
 flash-attn
 ```
 
-For Local Inference:
+For Local Inference (support DP and TP, managed by accelerate from huggingface):
 
 ```bash
 pip install flash-attn --no-build-isolation
@@ -75,22 +75,13 @@ git clone https://github.com/Labman42/JetEngine.git
 cd JetEngine
 pip install .
 ```
-For RL training usage (support DP and TP, managed by accelerate from huggingface):
+
+## Model Download
 
 ```bash
-pip install flash-attn --no-build-isolation
-git clone https://github.com/Labman42/JetEngine.git
-cd JetEngine
-git checkout accelerate
-pip install .
-```
-
-## Manual Download
-If you prefer to download the model weights manually, use the following command:
-```bash
-huggingface-cli download --resume-download JetLM/SDAR-1.7B-Chat \
+hf download --resume-download JetLM/SDAR-1.7B-Chat \
+  --repo-type model \
   --local-dir ~/huggingface/SDAR-1.7B-Chat/ \
-  --local-dir-use-symlinks False
 ```
 
 ## Quick Start
@@ -101,7 +92,15 @@ On default, use all gpus for Data Parallel
 accelerate launch --multi_gpu dist_example.py
 ```
 
-See `example.py` for usage. The API mirrors vLLM's interface with some differences in the `LLM.generate` method.
+Use single GPU
+
+```bash
+CUDA_VISIBLE_DEVICES='0' accelerate launch --multi_gpu dist_example.py
+```
+
+or you can add your own config file for accelerate.
+
+See `disg_example.py` for usage. Please check the `config.py` and `sampling_params.py` carefully.
 
 ## 📬 Contact
 
