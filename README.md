@@ -89,18 +89,18 @@ hf download --resume-download JetLM/SDAR-1.7B-Chat \
 On default, use all gpus for Data Parallel
 
 ```bash
-accelerate launch --multi_gpu dist_example.py
+accelerate launch --multi_gpu example.py
 ```
 
 Use single GPU
 
 ```bash
-CUDA_VISIBLE_DEVICES='0' accelerate launch --multi_gpu dist_example.py
+CUDA_VISIBLE_DEVICES='0' accelerate launch --multi_gpu example.py
 ```
 
 or you can add your own config file for accelerate.
 
-See `disg_example.py` for usage. Please check the `config.py` and `sampling_params.py` carefully.
+See `example.py` for usage. Please check the `config.py` and `sampling_params.py` carefully.
 
 ## 📬 Contact
 
