@@ -14,25 +14,11 @@ from jetengine.engine.sequence import Sequence, RunType
 from jetengine.engine.scheduler import Scheduler
 from jetengine.engine.model_runner import ModelRunner
 from jetengine.utils.loader import load_from_hf_model
+from jetengine.utils.statics import _estimate_kv_cache_usage, _actual_estimate_kv_cache_usage
 from jetengine.engine.distributed_manager import DistributedManager
 
 
-def _estimate_kv_cache_usage(config: Config) -> tuple[int, int]:
-    tokens_per_sequence = config.max_model_len
-    blocks_per_sequence = math.ceil(tokens_per_sequence / config.kvcache_block_size)
-    total_blocks = blocks_per_sequence * config.max_num_seqs
 
-    num_kv_heads = config.num_key_value_heads // config.tensor_parallel_size
-    block_bytes = (
-        2
-        * config.num_hidden_layers
-        * config.kvcache_block_size
-        * num_kv_heads
-        * config.head_dim
-        * config.torch_dtype.itemsize
-    )
-    total_bytes = total_blocks * block_bytes
-    return total_blocks, total_bytes
 
 
 class LLMEngine:
@@ -41,7 +27,7 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
-
+        
         est_blocks, est_bytes = _estimate_kv_cache_usage(config)
         est_gib = est_bytes / (1024 ** 3)
         print(
@@ -332,6 +318,16 @@ class LLMEngine:
         Stream prompts through the engine while keeping up to `max_active` sequences running.
         As sequences finish, new prompts are added from the pending list to maximize GPU utilization.
         """
+        est_blocks, est_bytes = _actual_estimate_kv_cache_usage(sampling_params.max_tokens, max_active, self.config)
+        est_gib = est_bytes / (1024 ** 3)
+        print(
+            f"[KVCache] Estimating {est_blocks:,} blocks "
+            f"({est_gib:.2f} GiB) for up to {max_active:,} active sequences "
+            f"of length {sampling_params.max_tokens:,} tokens."
+        )
+        print(
+            f"[logits] Estimating ({4 * self.config.hf_config.vocab_size * max_active * sampling_params.block_length/ (1024 ** 3):.2f}GiB) "
+        )
         total = len(prompts)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * total
