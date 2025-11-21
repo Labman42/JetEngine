@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import torch
 from torch.nn import functional as F
 import numpy as np
+import random
 
 from jetengine.config import Config
 from jetengine.engine.sequence import Sequence, SequenceStatus, RunType
@@ -32,6 +33,8 @@ class Scheduler:
         self.eos = config.eos
         self.mask_token_id = config.mask_token_id
         self.diversity_enforce = config.diversity_enforce
+        self.epsilon_greedy = config.epsilon_greedy
+        self.epsilon = config.epsilon
         self.barrier = config.diversity_enforce_barrier
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.running: list[Sequence] = []
@@ -386,7 +389,17 @@ class Scheduler:
                 transfer_index = torch.zeros_like(mask_token_mask)
                 transfer_index.scatter_(1, order[:, :max_k], k_mask)
                 transfer_index &= mask_token_mask
-
+        elif strategy == "random":
+            B, L = mask_token_mask.shape
+            scores = torch.rand((B, L), device=device)
+            scores = scores.masked_fill(~mask_token_mask, -1.0)
+            max_k = int(effective_num_to_transfer.max().item())
+            if max_k > 0:
+                _, top_indices = scores.topk(max_k, dim=-1)
+                k_mask = torch.arange(max_k, device=device).unsqueeze(0) < effective_num_to_transfer.unsqueeze(1)
+                transfer_index = torch.zeros_like(mask_token_mask, dtype=torch.bool)
+                transfer_index.scatter_(1, top_indices, k_mask)
+                transfer_index &= mask_token_mask
         else:
             raise ValueError(f"Unsupported remasking strategy: {strategy}")
 
@@ -519,11 +532,15 @@ class Scheduler:
             strategies = [seq.remasking_strategy if status == SequenceStatus.DENOISING else '' for seq, status in zip(seqs, all_statuses)]
             # Overwrite Strategy
             if self.diversity_enforce:
-                strategies = [strategy if seq.num_generated_tokens > self.barrier else 'sequential' for strategy, seq in zip(strategies, seqs)]
+                strategies = [strategy if (seq.num_generated_tokens > self.barrier) else 'sequential' for strategy, seq in zip(strategies, seqs)]
+            elif self.epsilon_greedy:
+                strategies = ['random' if random.random() < self.epsilon else strategy for strategy in strategies ]
+                # strategies = [strategy if (seq.num_generated_tokens > self.barrier and seq.num_generated_tokens < seq.max_tokens//2 ) else 'sequential' for strategy, seq in zip(strategies, seqs)]
             seq_mask = torch.tensor([s == 'sequential' for s in strategies], device=device).unsqueeze(1)
             low_conf_static_mask = torch.tensor(['low_confidence_static' in s for s in strategies], device=device).unsqueeze(1)
             low_conf_dynamic_mask = torch.tensor(['low_confidence_dynamic' in s for s in strategies], device=device).unsqueeze(1)
             entropy_bounded_mask = torch.tensor(['entropy_bounded' in s for s in strategies], device=device).unsqueeze(1)
+            random_mask = torch.tensor([s == 'random' for s in strategies], device=device).unsqueeze(1)
             
             # Initialize the final index of all tokens to be transferred
             # Shape: (B, L)
@@ -669,6 +686,24 @@ class Scheduler:
 
                 # Apply only to sequences using this strategy
                 transfer_index = torch.where(entropy_bounded_mask, eb_transfer_index, transfer_index)
+                
+            if random_mask.any():
+                # random scores
+                B, L = mask_token_mask.shape
+                scores = torch.rand((B, L), device=device)
+                scores = scores.masked_fill(~mask_token_mask, -1.0)
+                
+                max_k = batch_num_to_transfer.max().item()
+                _, top_indices = scores.topk(max_k, dim=-1)
+                # Create a mask to select the *correct* number of K for each sequence
+                # Shape: (B, max_k)
+                k_mask = torch.arange(max_k, device=device).unsqueeze(0) < batch_num_to_transfer.unsqueeze(1)
+                
+                # Scatter the 'True' values into a (B, L) tensor
+                random_transfer_index = torch.zeros_like(mask_token_mask, dtype=torch.bool).scatter_(1, top_indices, k_mask)
+                
+                # Apply only to sequences using this strategy
+                transfer_index = torch.where(random_mask, random_transfer_index, transfer_index)
                 
             # Final transfer index must be denoising AND a mask token
             final_transfer_index = transfer_index & mask_token_mask

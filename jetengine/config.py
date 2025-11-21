@@ -21,6 +21,8 @@ class Config:
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
     diversity_enforce: bool = False
+    epsilon_greedy: bool = False
+    epsilon: float = 0.1
     diversity_enforce_barrier: int = 100
     hf_config: AutoConfig | None = None
     eos: int = -1

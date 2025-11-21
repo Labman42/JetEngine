@@ -180,10 +180,9 @@ class LLMEngine:
 
         finished_sequences: list[Sequence] = []
         postprocess_fn = (
-            self.scheduler.postprocess_unify
-            # self.scheduler.postprocess
-            if getattr(self.scheduler, "consistent_sampling_params", False)
-            else self.scheduler.postprocess
+            self.scheduler.postprocess
+            if not getattr(self.scheduler, "consistent_sampling_params", False) or self.config.diversity_enforce or self.config.epsilon_greedy
+            else self.scheduler.postprocess_unify
         )
 
         if schedule_result.prefill:

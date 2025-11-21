@@ -87,6 +87,9 @@ class ModelRunner:
         config.num_kvcache_blocks = int(
             total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
+        print(f"[rank {dist.get_rank()}][KVCache] Allocated {config.num_kvcache_blocks:,} blocks "
+        f"({config.num_kvcache_blocks * block_bytes / (1024**3):.2f} GiB) "
+        f"based on peak memory usage.")
         self.kv_cache = torch.zeros(2, config.num_hidden_layers, config.num_kvcache_blocks,
                                     self.block_size, num_kv_heads, config.head_dim)
         layer_id = 0
@@ -373,10 +376,11 @@ class ModelRunner:
             required_blocks = context.block_tables.shape[1]
             if required_blocks > graph_block_tables.shape[1]:
                 if self.rank == 0:
-                    print(
-                        "[CUDAGraph] Block table requirement exceeds captured capacity; "
-                        "falling back to eager execution."
-                    )
+                    # print(
+                    #     "[CUDAGraph] Block table requirement exceeds captured capacity; "
+                    #     "falling back to eager execution."
+                    # )
+                    pass
                 return None, False
             graph_block_tables[:, :required_blocks].copy_(context.block_tables)
 
