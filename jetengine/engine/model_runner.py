@@ -288,23 +288,32 @@ class ModelRunner:
         return input_ids, positions
     
     def prepare_denoise(self, seqs: list[Sequence]):
-        block_len = len(seqs[0].intermediate_block_tokens)
         device = torch.device("cuda")
-        cached_lens_cpu = torch.tensor(
+        
+        # Optimization: Stack tensors directly from sequences (assumed to be on device or easily movable)
+        # This avoids creating a large list of integers and then converting to tensor on CPU
+        block_tokens_list = []
+        for seq in seqs:
+            t = seq.intermediate_block_tokens
+            if t.device != device:
+                t = t.to(device, non_blocking=True)
+                seq.intermediate_block_tokens = t # Update sequence state for future steps
+            block_tokens_list.append(t)
+            
+        input_ids = torch.stack(block_tokens_list).view(-1)
+
+        # Create cached_lens directly on device if possible, or move efficiently
+        # len(seq) is fast (list len), so creating tensor on CPU then moving is standard for small batches
+        # But we can try to avoid pin_memory overhead for small tensors if we want, 
+        # though pin_memory is generally good. 
+        # Let's stick to the pattern but ensure it's efficient.
+        cached_lens = torch.tensor(
             [len(seq) for seq in seqs], 
             dtype=torch.int32, 
-            pin_memory=True
+            device=device
         )
-        cached_lens = cached_lens_cpu.to(device=device, non_blocking=True)
         
-        input_ids_list = [seq.intermediate_block_tokens for seq in seqs]
-        input_ids_cpu = torch.tensor(
-            input_ids_list, 
-            dtype=torch.int64, 
-            pin_memory=True
-        ).view(-1) # Flatten to (B * L,)
-        input_ids = input_ids_cpu.to(device=device, non_blocking=True)
-
+        block_len = seqs[0].block_length
         start_positions = cached_lens.unsqueeze(1)
         offsets = torch.arange(
             block_len, 
@@ -312,7 +321,7 @@ class ModelRunner:
             device=device
         ).unsqueeze(0)
 
-        positions = (start_positions + offsets).view(-1) # Flatten to (B * L,)
+        positions = (start_positions + offsets).view(-1)
         block_tables = self.prepare_block_tables(seqs)
 
         set_context(
@@ -431,7 +440,7 @@ class ModelRunner:
         outputs = torch.zeros(
             max_global_bs, config.hidden_size, dtype=config.torch_dtype
         )
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.graph_bs = [bs for bs in [1, 2, 4, 8] if bs <= max_bs] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
         self.graph_pool = None
 

@@ -14,5 +14,6 @@ class SamplingParams:
     eb_threshold: float = 0.35
     topk: int = 0
     topp: float = 1
-    remasking_strategy: Literal['sequential', 'low_confidence_static', 'low_confidence_dynamic', 'entropy_bounded'] = 'low_confidence_static'
+    repetition_penalty: float = 1.0
+    remasking_strategy: Literal['sequential', 'low_confidence_static', 'low_confidence_dynamic', 'entropy_bounded', 'random'] = 'low_confidence_static'
     stop_words: list[int] | None = None

@@ -44,6 +44,24 @@ class Scheduler:
                                 Temperature(),      # Scale logits by temperature
                                 Softmax(),          # Convert logits to probabilities
                             ])
+        
+    def apply_repetition_penalty(self, probs: torch.Tensor, seqs: list[Sequence]):
+        # probs: (batch_size, block_len, vocab_size)
+        for i, seq in enumerate(seqs):
+            if seq.repetition_penalty == 1.0 or seq.num_tokens <= seq.max_tokens // 2:
+                continue
+            
+            penalty = seq.repetition_penalty
+            seen_tokens = list(seq.token_counts.keys())
+            
+            # Apply penalty to all positions in the block for the seen tokens
+            # We use advanced indexing. 
+            # probs[i, :, seen_tokens] selects (block_len, num_seen)
+            if seen_tokens:
+                probs[i, :, seen_tokens] /= penalty
+                
+            # Renormalize
+            probs[i] /= probs[i].sum(dim=-1, keepdim=True)
 
     def add(self, seq: Sequence):
         if not self._try_add_to_running(seq):
@@ -93,6 +111,9 @@ class Scheduler:
         while self.prefill_ready:
             seq = self.prefill_ready.popleft()
             if seq.is_finished:
+                # Fix: Ensure we deallocate if a finished sequence was in prefill_ready
+                if seq.block_table:
+                    self.block_manager.deallocate(seq)
                 continue
             if seq.status not in (SequenceStatus.PREFILLING, SequenceStatus.WAITING):
                 continue
@@ -103,18 +124,32 @@ class Scheduler:
     def _prepare_denoise_batch(self, prefill_batch: list[Sequence]) -> list[Sequence]:
         batch: list[Sequence] = []
         prefill_ids = {seq.seq_id for seq in prefill_batch}
+        
+        requests: list[tuple[Sequence, int]] = []
+        total_needed = 0
+        # We need to check availability dynamically or conservatively.
+        # Since we are single-threaded here, we can check current free blocks.
+        available_blocks = len(self.block_manager.free_block_ids)
+        
         for seq in self.running:
             if seq.seq_id in prefill_ids:
                 continue
             if seq.status not in (SequenceStatus.DENOISING, SequenceStatus.SAVING):
                 continue
+                
             num_new_blocks = seq.num_new_blocks_needed(self.block_manager.block_size)
             if num_new_blocks > 0:
-                if not self.block_manager.can_append_blocks(num_new_blocks):
-                    print(f"[Warning] Cannot append {num_new_blocks} blocks for seq {seq.seq_id}.")
+                if total_needed + num_new_blocks > available_blocks:
+                    print(f"[Warning] Cannot append {num_new_blocks} blocks for seq {seq.seq_id}. Not enough memory.")
                     continue
-                self.block_manager.append_blocks(seq, num_new_blocks)
+                requests.append((seq, num_new_blocks))
+                total_needed += num_new_blocks
+            
             batch.append(seq)
+            
+        if requests:
+            self.block_manager.append_blocks_batch(requests)
+            
         return batch
 
     def schedule(self) -> ScheduleResult:
@@ -161,7 +196,8 @@ class Scheduler:
                 
                     seq_x0_logp = torch.log(seq_x0_p.clamp_min(EPS))
                     
-                    current_block_tensor = torch.tensor(seq.intermediate_block_tokens, device=logits.device)
+                    # Use tensor directly
+                    current_block_tensor = seq.intermediate_block_tokens.to(logits.device)
                     mask_index = (current_block_tensor == self.mask_token_id)
                     num_to_transfer = seq.num_transfer_tokens_per_step[seq.current_denoising_step]
                     
@@ -187,7 +223,7 @@ class Scheduler:
                             transfer_index[top_indices] = True
                         num_to_transfer = transfer_index.sum().item() if transfer_index.sum().item() > 0 else num_to_transfer
                     elif 'entropy_bounded' in seq.remasking_strategy:
-                        block_probs = probs[start_idx : start_idx + block_len]
+                        block_probs = probs[start_idx : start_idx + block_len] if not self.consistent_sampling_params else probs[start_idx : start_idx + block_len]
                         P = block_probs[mask_index]
                         entropies = -(P.clamp_min(EPS) * (P.clamp_min(EPS)).log()).sum(dim=-1)
                         ent_sorted, order = torch.sort(entropies, dim=0, descending=False)
@@ -201,41 +237,32 @@ class Scheduler:
                         transfer_index[selected_token_indices] = True
                         num_to_transfer = k
 
-                    # update
-                    new_block_list = current_block_tensor.tolist()
-                    accepted_tokens = seq_x0[transfer_index].tolist()
-                    accepted_tokens_entropy = seq_entropies[transfer_index].tolist()
-                    accepted_tokens_logprobs = seq_x0_logp[transfer_index].tolist()
-                    new_block_list_entropy = torch.tensor(seq.intermediate_block_tokens_entropy, device=logits.device).tolist()
-                    original_indices = transfer_index.nonzero(as_tuple=True)[0].tolist()
+                    # update - Tensors
+                    seq.intermediate_block_tokens = torch.where(transfer_index, seq_x0, current_block_tensor)
+                    seq.intermediate_block_tokens_entropy = torch.where(transfer_index, seq_entropies, seq.intermediate_block_tokens_entropy.to(logits.device))
                     
                     # track trajectory
-                    if seq.block_trajectory is None or len(seq.block_trajectory) != block_len:
-                        seq.block_trajectory = [0] * block_len
+                    if seq.block_trajectory is None: # Should not happen with new init but safe check
+                         seq.block_trajectory = torch.zeros(block_len, dtype=torch.long, device=logits.device)
+                    else:
+                        seq.block_trajectory = seq.block_trajectory.to(logits.device)
+
+                    if seq.block_logprobs is None:
+                        seq.block_logprobs = torch.zeros(block_len, dtype=torch.float, device=logits.device)
+                    else:
+                        seq.block_logprobs = seq.block_logprobs.to(logits.device)
                         
-                    if seq.block_logprobs is None or len(seq.block_logprobs) != block_len:
-                        seq.block_logprobs = [0.0] * block_len
-                    if seq.block_entropies is None or len(seq.block_entropies) != block_len:
-                        seq.block_entropies = [0.0] * block_len
+                    if seq.block_entropies is None:
+                        seq.block_entropies = torch.zeros(block_len, dtype=torch.float, device=logits.device)
+                    else:
+                        seq.block_entropies = seq.block_entropies.to(logits.device)
                         
                     first_time_global = seq.global_denoising_step + 1
-                    for idx, token, entropy, logprob in zip(
-                        original_indices, 
-                        accepted_tokens, 
-                        accepted_tokens_entropy,
-                        accepted_tokens_logprobs
-                    ):
-                        new_block_list[idx] = token
-                        new_block_list_entropy[idx] = entropy
-                        # Track trajectory (only mark once)
-                        if seq.block_trajectory[idx] == 0:
-                            seq.block_trajectory[idx] = first_time_global
-                        # NEW: Store logprobs and entropies (update every time)
-                        seq.block_logprobs[idx] = logprob
-                        seq.block_entropies[idx] = entropy
-                        
-                    seq.intermediate_block_tokens = new_block_list
-                    seq.intermediate_block_tokens_entropy = new_block_list_entropy
+                    
+                    # Vectorized updates
+                    seq.block_trajectory = torch.where(transfer_index & (seq.block_trajectory == 0), torch.tensor(first_time_global, device=logits.device), seq.block_trajectory)
+                    seq.block_logprobs = torch.where(transfer_index, seq_x0_logp, seq.block_logprobs)
+                    seq.block_entropies = torch.where(transfer_index, seq_entropies, seq.block_entropies)
                     
                     seq.current_denoising_step += 1
                     seq.global_denoising_step += 1
@@ -265,6 +292,9 @@ class Scheduler:
             self.block_manager.deallocate(seq)
             
     def postprocess_unify(self, seqs: list[Sequence], logits: torch.Tensor, run_type: RunType) -> list[Sequence]:
+        # This function seems to be a duplicate or alternative to postprocess. 
+        # I will update it to match the logic but it seems unused in the main path if consistent_sampling_params is False.
+        # For now, I'll focus on updating it to be tensor-compatible.
         if run_type == RunType.PREFILL:
             for seq in seqs:
                 seq.num_cached_tokens = seq.num_prefill_tokens
@@ -279,6 +309,7 @@ class Scheduler:
         block_len = seqs[0].block_length
 
         probs = self.sample_pipe(logits, temperature=seqs[0].temperature).view(batch_size, block_len, -1)
+        self.apply_repetition_penalty(probs, seqs)
         entropies_all = -(probs.clamp_min(EPS) * (probs.clamp_min(EPS)).log()).sum(dim=-1)
 
         flat_probs = probs.view(-1, probs.shape[-1])
@@ -289,18 +320,12 @@ class Scheduler:
         batch_seq_x0_p = torch.gather(flat_probs, 1, flat_samples.unsqueeze(-1)).view(batch_size, block_len)
         batch_seq_x0_logp = torch.log(batch_seq_x0_p.clamp_min(EPS))
 
-        batch_current_tokens = torch.tensor(
-            [seq.intermediate_block_tokens for seq in seqs], device=device, dtype=torch.int64
-        )
-        batch_logprobs = torch.tensor(
-            [seq.block_logprobs or [0.0] * block_len for seq in seqs], device=device, dtype=torch.float
-        )
-        batch_entropies = torch.tensor(
-            [seq.block_entropies or [0.0] * block_len for seq in seqs], device=device, dtype=torch.float
-        )
-        batch_trajectory = torch.tensor(
-            [seq.block_trajectory or [0] * block_len for seq in seqs], device=device, dtype=torch.long
-        )
+        # Stack tensors from sequences
+        batch_current_tokens = torch.stack([seq.intermediate_block_tokens.to(device) for seq in seqs])
+        batch_logprobs = torch.stack([seq.block_logprobs.to(device) for seq in seqs])
+        batch_entropies = torch.stack([seq.block_entropies.to(device) for seq in seqs])
+        batch_trajectory = torch.stack([seq.block_trajectory.to(device) for seq in seqs])
+        
         batch_global_step_plus_1 = torch.tensor(
             [seq.global_denoising_step + 1 for seq in seqs], device=device, dtype=torch.long
         ).unsqueeze(1)
@@ -427,11 +452,11 @@ class Scheduler:
 
         for i, seq in enumerate(seqs):
             if seq.status == SequenceStatus.DENOISING:
-                seq.intermediate_block_tokens = batch_new_tokens[i].tolist()
-                seq.intermediate_block_tokens_entropy = batch_new_entropies[i].tolist()
-                seq.block_trajectory = batch_new_trajectory[i].tolist()
-                seq.block_logprobs = batch_new_logprobs[i].tolist()
-                seq.block_entropies = batch_new_entropies[i].tolist()
+                seq.intermediate_block_tokens = batch_new_tokens[i]
+                seq.intermediate_block_tokens_entropy = batch_new_entropies[i]
+                seq.block_trajectory = batch_new_trajectory[i]
+                seq.block_logprobs = batch_new_logprobs[i]
+                seq.block_entropies = batch_new_entropies[i]
                 seq.current_denoising_step = new_denoising_steps[i].item()
                 seq.global_denoising_step = new_global_steps[i].item()
                 seq.num_to_transfer = final_transfer_index[i].sum().item()
@@ -466,299 +491,192 @@ class Scheduler:
             block_len = seqs[0].block_length # Assume all are same
 
             # --- 1. Batched Sampling & Initial Calculations ---
-            # Reshape logits to (B, L, V) for easier processing
-            # if logits.dim() == 2:
-            #     logits = logits.view(batch_size, block_len, -1) # (B*L, V) -> (B, L, V)
-
-            probs = self.sample_pipe(logits, temperature=seqs[0].temperature).view(batch_size, block_len, -1)
-            entropies_all = -(probs.clamp_min(EPS) * (probs.clamp_min(EPS)).log()).sum(dim=-1)
             if self.consistent_sampling_params:
-                # These are scalars, apply to all
+                probs = self.sample_pipe(logits, temperature=seqs[0].temperature).view(batch_size, block_len, -1)
+                self.apply_repetition_penalty(probs, seqs)
+            else:
+                # Handle diverse temperatures
+                # Logits: (B*L, V) or (B, L, V)
+                if logits.dim() == 3:
+                    logits = logits.view(-1, logits.shape[-1])
+                
+                # Create temperature tensor (B*L, 1)
+                temps = torch.tensor([seq.temperature for seq in seqs], device=device, dtype=torch.float)
+                temps = temps.repeat_interleave(block_len).unsqueeze(1)
+                
+                # Apply temperature
+                logits = logits / temps
+                probs = F.softmax(logits, dim=-1).view(batch_size, block_len, -1)
+                self.apply_repetition_penalty(probs, seqs)
+
+            entropies_all = -(probs.clamp_min(EPS) * (probs.clamp_min(EPS)).log()).sum(dim=-1)
+            
+            if self.consistent_sampling_params:
                 batch_top_k = seqs[0].top_k
                 batch_top_p = seqs[0].top_p
             else:
-                # These are tensors
                 batch_top_p = torch.tensor([seq.top_p for seq in seqs], device=device, dtype=torch.float)
                 batch_top_k = torch.tensor([seq.top_k for seq in seqs], device=device, dtype=torch.long)
-            # Perform sampling for the entire batch
-            # Shape: (B, L)
+            
             batch_seq_x0 = top_k_top_p_sampling_from_probs(
-                probs.view(-1, probs.shape[-1]), # Sampler might expect (N, V)
+                probs.view(-1, probs.shape[-1]), 
                 top_k=batch_top_k, 
                 top_p=batch_top_p
             ).to(torch.int64).view(batch_size, block_len)
             
-            # Get probabilities and log-probabilities of the sampled tokens
-            # Shape: (B, L)
             batch_seq_x0_p = torch.gather(probs, -1, batch_seq_x0.unsqueeze(-1)).squeeze(-1)
             batch_seq_x0_logp = torch.log(batch_seq_x0_p.clamp_min(EPS))
-            # Create tensors for all sequence states
-            batch_current_tokens = torch.tensor(
-                [seq.intermediate_block_tokens for seq in seqs], device=device, dtype=torch.int64)
             
-            batch_logprobs = torch.tensor(
-                [seq.block_logprobs or [0.0]*block_len for seq in seqs], device=device, dtype=torch.float)
+            # Stack tensors from sequences
+            batch_current_tokens = torch.stack([seq.intermediate_block_tokens.to(device) for seq in seqs])
+            batch_logprobs = torch.stack([seq.block_logprobs.to(device) for seq in seqs])
+            batch_entropies = torch.stack([seq.block_entropies.to(device) for seq in seqs])
+            batch_trajectory = torch.stack([seq.block_trajectory.to(device) for seq in seqs])
             
-            batch_entropies = torch.tensor(
-                [seq.block_entropies or [0.0]*block_len for seq in seqs], device=device, dtype=torch.float)
-
-            batch_trajectory = torch.tensor(
-                [seq.block_trajectory or [0]*block_len for seq in seqs], device=device, dtype=torch.long)
-            
-            # Get current num_to_transfer for each sequence in DENOISING state
             num_to_transfer_list = [
                 seq.num_transfer_tokens_per_step[seq.current_denoising_step] 
                 if seq.status == SequenceStatus.DENOISING else 0 
                 for seq in seqs
             ]
             batch_num_to_transfer = torch.tensor(num_to_transfer_list, device=device, dtype=torch.long)
-            # Get global step for trajectory tracking
+            
             batch_global_step_plus_1 = torch.tensor(
                 [seq.global_denoising_step + 1 for seq in seqs], device=device, dtype=torch.long).unsqueeze(1) # (B, 1)
             
-            # Status masks (boolean)
             all_statuses = [seq.status for seq in seqs]
             denoising_mask_bool = torch.tensor([s == SequenceStatus.DENOISING for s in all_statuses], device=device)
             saving_mask_bool = torch.tensor([s == SequenceStatus.SAVING for s in all_statuses], device=device)
             
-            # Broadcastable (B, 1) mask for filtering tensors
             denoising_mask = denoising_mask_bool.unsqueeze(1) 
             
-            # Mask of all MASK tokens in DENOISING sequences
-            # Shape: (B, L)
             mask_token_mask = (batch_current_tokens == self.mask_token_id) & denoising_mask
 
-            # Strategy masks
             strategies = [seq.remasking_strategy if status == SequenceStatus.DENOISING else '' for seq, status in zip(seqs, all_statuses)]
-            # Overwrite Strategy
             if self.diversity_enforce:
                 strategies = [strategy if (seq.num_generated_tokens > self.barrier) else 'sequential' for strategy, seq in zip(strategies, seqs)]
             elif self.epsilon_greedy:
                 strategies = ['random' if random.random() < self.epsilon else strategy for strategy in strategies ]
-                # strategies = [strategy if (seq.num_generated_tokens > self.barrier and seq.num_generated_tokens < seq.max_tokens//2 ) else 'sequential' for strategy, seq in zip(strategies, seqs)]
+            
             seq_mask = torch.tensor([s == 'sequential' for s in strategies], device=device).unsqueeze(1)
             low_conf_static_mask = torch.tensor(['low_confidence_static' in s for s in strategies], device=device).unsqueeze(1)
             low_conf_dynamic_mask = torch.tensor(['low_confidence_dynamic' in s for s in strategies], device=device).unsqueeze(1)
             entropy_bounded_mask = torch.tensor(['entropy_bounded' in s for s in strategies], device=device).unsqueeze(1)
             random_mask = torch.tensor([s == 'random' for s in strategies], device=device).unsqueeze(1)
             
-            # Initialize the final index of all tokens to be transferred
-            # Shape: (B, L)
             transfer_index = torch.zeros((batch_size, block_len), dtype=torch.bool, device=device)
             
-            # --- Strategy: 'sequential' ---
             if seq_mask.any():
-                # Find the first mask position for each sequence
-                first_mask_pos = torch.argmax(mask_token_mask.int(), dim=1, keepdim=True) # (B, 1)
-                
-                # Create a range tensor [0, 1, ..., L-1]
-                range_tensor = torch.arange(block_len, device=device).unsqueeze(0) # (1, L)
-                
-                # Create start and end transfer positions for each sequence
+                first_mask_pos = torch.argmax(mask_token_mask.int(), dim=1, keepdim=True)
+                range_tensor = torch.arange(block_len, device=device).unsqueeze(0)
                 start_pos_b = first_mask_pos
                 end_pos_b = (start_pos_b + batch_num_to_transfer.unsqueeze(1)).clamp_max(block_len)
-                
-                # Create the transfer mask for sequential strategy
                 seq_transfer_index = (range_tensor >= start_pos_b) & (range_tensor < end_pos_b) & mask_token_mask
-                
-                # Apply only to sequences using this strategy
                 transfer_index = torch.where(seq_mask, seq_transfer_index, transfer_index)
 
-            # --- Strategy: 'low_confidence_static' ---
             if low_conf_static_mask.any():
-                # Calculate confidence, setting non-masked tokens to -inf
                 confidence = torch.where(mask_token_mask, batch_seq_x0_p, -torch.inf)
-                
-                # Get the max K needed across all sequences
                 max_k = batch_num_to_transfer.max().item()
-                
-                # Get the top-k indices (B, max_k)
                 _, top_indices = torch.topk(confidence, k=max_k, dim=1)
-                
-                # Create a mask to select the *correct* number of K for each sequence
-                # Shape: (B, max_k)
                 k_mask = torch.arange(max_k, device=device).unsqueeze(0) < batch_num_to_transfer.unsqueeze(1)
-                
-                # Scatter the 'True' values into a (B, L) tensor
                 static_transfer_index = torch.zeros_like(confidence, dtype=torch.bool).scatter_(1, top_indices, k_mask)
-                
-                # Apply only to sequences using this strategy
                 transfer_index = torch.where(low_conf_static_mask, static_transfer_index, transfer_index)
 
-            # --- Strategy: 'low_confidence_dynamic' ---
             if low_conf_dynamic_mask.any():
                 dyn_thresholds = torch.tensor([seq.dynamic_threshold for seq in seqs], device=device).unsqueeze(1)
                 confidence = torch.where(mask_token_mask, batch_seq_x0_p, -torch.inf)
-                
-                # Initial transfer index based on threshold
                 dyn_transfer_index = (confidence > dyn_thresholds)
-                
-                # Check which sequences didn't meet the minimum `num_to_transfer`
                 num_transferred_dyn = dyn_transfer_index.sum(dim=1)
                 needs_fallback = (num_transferred_dyn < batch_num_to_transfer) & low_conf_dynamic_mask.squeeze()
                 
-                # if needs_fallback.any():
-                #     # Get max K for only the sequences that need fallback
-                #     fallback_k_values = batch_num_to_transfer[needs_fallback]
-                #     max_k_dyn = fallback_k_values.max().item()
-                    
-                #     # Get top-k for *only* the fallback sequences
-                #     _, top_indices_dyn = torch.topk(confidence[needs_fallback], k=max_k_dyn, dim=1)
-                    
-                #     # Create the K-mask for the fallback sequences
-                #     k_mask_dyn = torch.arange(max_k_dyn, device=device).unsqueeze(0) < fallback_k_values.unsqueeze(1)
-                    
-                #     # Scatter to create the new transfer indices for fallback sequences
-                #     fallback_indices = torch.zeros((needs_fallback.sum(), block_len), dtype=torch.bool, device=device)
-                #     fallback_indices.scatter_(1, top_indices_dyn, k_mask_dyn)
-                    
-                #     # *Replace* the indices for the fallback sequences (as per original logic)
-                #     dyn_transfer_index[needs_fallback] = fallback_indices
-                
                 if needs_fallback.any():
-                    # Get the tensors for *only* the fallback sequences
-                    fallback_mask_token_mask = mask_token_mask[needs_fallback]  # (num_fallback, L)
-                    fallback_num_to_transfer = batch_num_to_transfer[needs_fallback].unsqueeze(1) # (num_fallback, 1)
-
-                    # Find the first mask position for each *fallback* sequence
-                    first_mask_pos = torch.argmax(fallback_mask_token_mask.int(), dim=1, keepdim=True) # (num_fallback, 1)
-                    
-                    # Create a range tensor [0, 1, ..., L-1]
-                    range_tensor = torch.arange(block_len, device=device).unsqueeze(0) # (1, L)
-                    
-                    # Create start and end transfer positions for each *fallback* sequence
+                    fallback_mask_token_mask = mask_token_mask[needs_fallback]
+                    fallback_num_to_transfer = batch_num_to_transfer[needs_fallback].unsqueeze(1)
+                    first_mask_pos = torch.argmax(fallback_mask_token_mask.int(), dim=1, keepdim=True)
+                    range_tensor = torch.arange(block_len, device=device).unsqueeze(0)
                     start_pos_b = first_mask_pos
                     end_pos_b = (start_pos_b + fallback_num_to_transfer).clamp_max(block_len)
-                    
-                    # Create the transfer mask for the *fallback* sequences
-                    # Ensure we only select actual mask tokens within the sequential range
                     fallback_indices = (range_tensor >= start_pos_b) & (range_tensor < end_pos_b) & fallback_mask_token_mask
-                    
-                    # *Replace* the threshold-based indices with the new sequential indices
                     dyn_transfer_index[needs_fallback] = fallback_indices
                 
-                # Update the batch_num_to_transfer tensor for sequences that used this strategy
                 batch_num_to_transfer = torch.where(
                     low_conf_dynamic_mask.squeeze(), 
                     dyn_transfer_index.sum(dim=1), 
                     batch_num_to_transfer
                 )
-                
-                # Apply only to sequences using this strategy
                 transfer_index = torch.where(low_conf_dynamic_mask, dyn_transfer_index, transfer_index)
 
-            # --- Strategy: 'entropy_bounded' ---
             if entropy_bounded_mask.any():
-                # Get entropies, setting non-masked tokens to +inf for ascending sort
                 masked_entropies = torch.where(mask_token_mask, entropies_all, torch.inf)
-                
-                # Sort entropies ascending
-                # We need all L tokens for stable indexing, so we sort over dim=1
                 ent_sorted, order = torch.sort(masked_entropies, dim=1, descending=False)
-                
-                # Replace infs with 0 so cumsum works
                 ent_sorted_masked = torch.where(ent_sorted == torch.inf, 0.0, ent_sorted)
-                
-                # Batched cumsum
                 cumsum = torch.cumsum(ent_sorted_masked, dim=1)
-                
-                # Get thresholds for each sequence
                 eb_thresholds = torch.tensor([seq.eb_threshold for seq in seqs], device=device).unsqueeze(1)
-                
-                # Find k for each sequence: number of tokens where cumsum < threshold
                 k_tensor = torch.searchsorted(cumsum, eb_thresholds, right=False)
-                
-                # Enforce "if k == 0: k = 1"
                 k_tensor.clamp_min_(1) 
-                
-                # Create a (B, L) mask based on k
                 k_mask_eb = torch.arange(block_len, device=device).unsqueeze(0) < k_tensor
+                # Fix: Use mask_token_mask or similar to initialize eb_transfer_index, not confidence which is undefined here
+                eb_transfer_index = torch.zeros_like(mask_token_mask, dtype=torch.bool).scatter_(1, order, k_mask_eb)
                 
-                # Scatter this mask back using the original sorted `order`
-                eb_transfer_index = torch.zeros_like(confidence, dtype=torch.bool).scatter_(1, order, k_mask_eb)
-                
-                # Update the batch_num_to_transfer tensor
                 batch_num_to_transfer = torch.where(
                     entropy_bounded_mask.squeeze(), 
                     k_tensor.squeeze(1), 
                     batch_num_to_transfer
                 )
-
-                # Apply only to sequences using this strategy
                 transfer_index = torch.where(entropy_bounded_mask, eb_transfer_index, transfer_index)
                 
             if random_mask.any():
-                # random scores
                 B, L = mask_token_mask.shape
                 scores = torch.rand((B, L), device=device)
                 scores = scores.masked_fill(~mask_token_mask, -1.0)
-                
                 max_k = batch_num_to_transfer.max().item()
                 _, top_indices = scores.topk(max_k, dim=-1)
-                # Create a mask to select the *correct* number of K for each sequence
-                # Shape: (B, max_k)
                 k_mask = torch.arange(max_k, device=device).unsqueeze(0) < batch_num_to_transfer.unsqueeze(1)
-                
-                # Scatter the 'True' values into a (B, L) tensor
                 random_transfer_index = torch.zeros_like(mask_token_mask, dtype=torch.bool).scatter_(1, top_indices, k_mask)
-                
-                # Apply only to sequences using this strategy
                 transfer_index = torch.where(random_mask, random_transfer_index, transfer_index)
                 
-            # Final transfer index must be denoising AND a mask token
             final_transfer_index = transfer_index & mask_token_mask
 
-            # Update tokens: (B, L)
             batch_new_tokens = torch.where(final_transfer_index, batch_seq_x0, batch_current_tokens)
-
-            # Update trajectory: (B, L)
-            # Only update if trajectory is 0 (first time being accepted)
             batch_new_trajectory = torch.where(
                 final_transfer_index & (batch_trajectory == 0), 
                 batch_global_step_plus_1, 
                 batch_trajectory
             )
-            
-            # Update logprobs and entropies: (B, L)
-            # These are updated *every time* a token is accepted
             batch_new_logprobs = torch.where(final_transfer_index, batch_seq_x0_logp, batch_logprobs)
             batch_new_entropies = torch.where(final_transfer_index, entropies_all, batch_entropies)
 
-            # Calculate final state changes
             new_denoising_steps = torch.tensor([seq.current_denoising_step for seq in seqs], device=device) + denoising_mask_bool.int()
             new_global_steps = torch.tensor([seq.global_denoising_step for seq in seqs], device=device) + denoising_mask_bool.int()
             
-            # Check for finished blocks
             is_fully_denoised = (~(batch_new_tokens == self.mask_token_id).any(dim=1)) | \
                                 (new_denoising_steps >= torch.tensor([seq.denoising_steps for seq in seqs], device=device))
 
-            # --- 6. Lightweight Disaggregation Loop ---
-            # This loop is now very fast, just for updating Python object state.
+            # Optimization: Move scalars to CPU in batch to avoid synchronization in loop
+            new_denoising_steps_cpu = new_denoising_steps.tolist()
+            new_global_steps_cpu = new_global_steps.tolist()
+            num_to_transfer_cpu = final_transfer_index.sum(dim=1).tolist()
+            is_fully_denoised_cpu = is_fully_denoised.tolist()
+            denoising_mask_cpu = denoising_mask_bool.tolist()
+            saving_mask_cpu = saving_mask_bool.tolist()
 
             for i, seq in enumerate(seqs):
-                if denoising_mask_bool[i]:
-                    # Update sequence state from the computed batch tensors
-                    seq.intermediate_block_tokens = batch_new_tokens[i].tolist()
-                    seq.intermediate_block_tokens_entropy = batch_new_entropies[i].tolist() # Use new entropies
+                if denoising_mask_cpu[i]:
+                    # Update sequence state - Keep as tensors!
+                    # Fix: Use .clone() to avoid keeping views of large batch tensors alive
+                    seq.intermediate_block_tokens = batch_new_tokens[i].clone()
+                    seq.intermediate_block_tokens_entropy = batch_new_entropies[i].clone()
+                    seq.block_trajectory = batch_new_trajectory[i].clone()
+                    seq.block_logprobs = batch_new_logprobs[i].clone()
+                    seq.block_entropies = batch_new_entropies[i].clone()
                     
-                    # Update trajectory and logprobs
-                    seq.block_trajectory = batch_new_trajectory[i].tolist()
-                    seq.block_logprobs = batch_new_logprobs[i].tolist()
-                    seq.block_entropies = batch_new_entropies[i].tolist() # Also update this one
+                    seq.current_denoising_step = new_denoising_steps_cpu[i]
+                    seq.global_denoising_step = new_global_steps_cpu[i]
+                    seq.num_to_transfer = num_to_transfer_cpu[i]
                     
-                    # Update step counters
-                    seq.current_denoising_step = new_denoising_steps[i].item()
-                    seq.global_denoising_step = new_global_steps[i].item()
-                    
-                    # Update the *actual* number of tokens transferred
-                    seq.num_to_transfer = final_transfer_index[i].sum().item()
-                    
-                    # Check if block is done
-                    if is_fully_denoised[i]:
+                    if is_fully_denoised_cpu[i]:
                         seq.status = SequenceStatus.SAVING
 
-                elif saving_mask_bool[i]:
-                    # This part remains the same, as it's state-machine logic
+                elif saving_mask_cpu[i]:
                     seq.commit_block(seq.intermediate_block_tokens)
                     seq.num_to_transfer = 0
                     if not seq.is_finished:
@@ -766,12 +684,22 @@ class Scheduler:
                     else:
                         self.block_manager.deallocate(seq)
 
+        # Optimization: Filter running list efficiently
+        # We already deallocated finished sequences in the loop (if they finished in SAVING state).
+        # But we might have sequences that finished in other ways (e.g. max tokens check outside loop? No, commit_block handles it).
+        # However, to be safe and avoid double deallocation overhead (even if safe), we can track indices.
+        
+        # Actually, the list comprehension [seq for seq in self.running if seq.is_finished] iterates ALL running seqs.
+        # If running has 64 items, it's fast.
+        # But calling deallocate again is redundant.
+        # Let's just filter.
+        
+        # User suggested logic:
         finished_seqs = [seq for seq in self.running if seq.is_finished]
-        if finished_seqs:
-            for seq in finished_seqs:
-                # Ensure KV cache blocks are freed promptly
-                self.block_manager.deallocate(seq)
-            self.running = [seq for seq in self.running if not seq.is_finished]
+        self.running = [seq for seq in self.running if not seq.is_finished]
+        for seq in finished_seqs:
+            self.block_manager.deallocate(seq)
+        
         if self.prefill_ready:
             self.prefill_ready = deque(
                 seq for seq in self.prefill_ready if not seq.is_finished

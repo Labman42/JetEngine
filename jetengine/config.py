@@ -30,6 +30,7 @@ class Config:
     num_kvcache_blocks: int = -1
     mask_token_id: int = -1
     block_length: int = 4
+    dtype: str = 'auto'
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -37,6 +38,19 @@ class Config:
         assert 1 <= self.tensor_parallel_size <= 8
         cfg = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
         self.hf_config = cfg
+        
+        # Determine torch_dtype
+        if self.dtype == "bfloat16":
+            self.torch_dtype = torch.bfloat16
+        elif self.dtype == "float16":
+            self.torch_dtype = torch.float16
+        else:
+            # auto
+            if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+                self.torch_dtype = torch.bfloat16
+            else:
+                self.torch_dtype = torch.float16
+
         if "llada" in cfg.model_type.lower():
             self.head_dim               = get_cfg_alias(cfg, "d_model") // get_cfg_alias(cfg, "n_heads")
             self.hidden_size            = get_cfg_alias(cfg, "d_model")
@@ -44,7 +58,7 @@ class Config:
             self.num_attention_heads    = get_cfg_alias(cfg, "n_heads")
             self.num_key_value_heads    = get_cfg_alias(cfg, "n_kv_heads")
             self.num_hidden_layers      = get_cfg_alias(cfg, "n_layers")
-            self.torch_dtype            = torch.bfloat16
+            # self.torch_dtype            = torch.bfloat16
         else:
             # standard HF configs
             self.hidden_size            = get_cfg_alias(cfg, "hidden_size")
@@ -53,7 +67,7 @@ class Config:
             self.num_hidden_layers      = get_cfg_alias(cfg, "num_hidden_layers")
             self.max_position_embeddings= get_cfg_alias(cfg, "max_position_embeddings")
             self.head_dim               = get_cfg_alias(cfg, "head_dim")
-            self.torch_dtype            = get_cfg_alias(cfg, "torch_dtype")
+            # self.torch_dtype            = get_cfg_alias(cfg, "torch_dtype")
 
         self.max_model_len = min(self.max_model_len, self.max_position_embeddings)
         assert self.max_num_batched_tokens >= self.max_model_len

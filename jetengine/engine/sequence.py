@@ -1,6 +1,8 @@
 from copy import copy
 from enum import Enum, auto
+from collections import Counter
 from itertools import count
+import torch
 from jetengine.sampling_params import SamplingParams
 
 
@@ -40,22 +42,27 @@ class Sequence:
         self.num_prompt_tokens = prompt_len # Keep track of the original full prompt length
         self.num_generated_tokens = self.num_tokens - self.num_prompt_tokens
         
-        self.intermediate_block_tokens = first_denoise_part + [mask_token_id] * (self.block_length - len(first_denoise_part))
-        self.intermediate_block_tokens_entropy = [0.0] * self.block_length
+        # Use tensors for block state. Initialize on CPU, move to GPU when needed/used.
+        # We keep them as tensors to avoid list<->tensor conversion overhead during generation.
+        self.intermediate_block_tokens = torch.tensor(
+            first_denoise_part + [mask_token_id] * (self.block_length - len(first_denoise_part)),
+            dtype=torch.long
+        )
+        self.intermediate_block_tokens_entropy = torch.zeros(self.block_length, dtype=torch.float)
         
         self.num_to_transfer = 0
         self.current_denoising_step = 0
 
         self.trajectory: list[int] = []
-        self.block_trajectory: list[int] | None = [0] * len(self.intermediate_block_tokens)
+        self.block_trajectory = torch.zeros(self.block_length, dtype=torch.long)
         self.global_denoising_step = 0
         
         # NEW: Add logprobs and entropies tracking
         self.logprobs: list[float] = []
-        self.block_logprobs: list[float] | None = [0.0] * len(self.intermediate_block_tokens)
+        self.block_logprobs = torch.zeros(self.block_length, dtype=torch.float)
         
         self.entropies: list[float] = []
-        self.block_entropies: list[float] | None = [0.0] * len(self.intermediate_block_tokens)
+        self.block_entropies = torch.zeros(self.block_length, dtype=torch.float)
         
         # initial status based on whether prefill is needed.
         if self.num_prefill_tokens > 0:
@@ -77,7 +84,10 @@ class Sequence:
         self.eb_threshold = sampling_params.eb_threshold
         self.mask_token_id = mask_token_id
         self.num_transfer_tokens_per_step = self._get_num_transfer_tokens()
-
+        
+        self.repetition_penalty = sampling_params.repetition_penalty
+        self.token_counts = Counter(self.prompt_token_ids)
+        
         # State for KV Caching
         self.num_cached_tokens = 0
         self.block_table = []
@@ -98,27 +108,20 @@ class Sequence:
 
     def start_new_block(self):
         self.current_denoising_step = 0
-        self.intermediate_block_tokens = [self.mask_token_id] * self.block_length
-        self.intermediate_block_tokens_entropy = [0.0] * self.block_length
-        self.block_trajectory = [0] * self.block_length
-        self.block_logprobs = [0.0] * self.block_length
-        self.block_entropies = [0.0] * self.block_length
+        # Reset tensors. We can reuse memory or create new ones. Creating new ones is safer for now.
+        # Ensure they are on the same device as before if possible, but for now CPU/default is fine
+        # as they will be moved to GPU in scheduler.
+        device = self.intermediate_block_tokens.device
+        self.intermediate_block_tokens = torch.full((self.block_length,), self.mask_token_id, dtype=torch.long, device=device)
+        self.intermediate_block_tokens_entropy = torch.zeros(self.block_length, dtype=torch.float, device=device)
+        self.block_trajectory = torch.zeros(self.block_length, dtype=torch.long, device=device)
+        self.block_logprobs = torch.zeros(self.block_length, dtype=torch.float, device=device)
+        self.block_entropies = torch.zeros(self.block_length, dtype=torch.float, device=device)
         self.status = SequenceStatus.DENOISING
 
-    def commit_block(self, block_tokens: list[int]):
-        # Trim block if it exceeds max_tokens or contains EOS
-        # final_block = []
-        # for i in range(self.generation_start_index, len(block_tokens)):
-        #     token_id = block_tokens[i]
-        #     # specify where to start generating within the first decoding block
-        #     if (not self.ignore_eos) and (token_id in self.stop_words):
-        #         final_block.append(token_id)
-        #         self.status = SequenceStatus.FINISHED
-        #         break
-        #     if self.num_completion_tokens + len(final_block) >= self.max_tokens:
-        #         self.status = SequenceStatus.FINISHED
-        #         break
-        #     final_block.append(token_id)
+    def commit_block(self, block_tokens: torch.Tensor | list[int]):
+        if isinstance(block_tokens, torch.Tensor):
+            block_tokens = block_tokens.tolist()
             
         start = self.generation_start_index
         # how many tokens we're still allowed to emit
@@ -151,22 +154,42 @@ class Sequence:
         self.token_ids.extend(block_tokens)
         self.num_tokens = len(self.token_ids)
         self.num_generated_tokens = self.num_tokens - self.num_prompt_tokens
-        self.intermediate_block_tokens = []
-        self.intermediate_block_tokens_entropy =[]
+        
+        
+        # Update token counts
+        self.token_counts.update(block_tokens)
+        
+        # Clear intermediate state
+        # self.intermediate_block_tokens = ... (will be reset in start_new_block)
         
         block_len = len(block_tokens)
         if self.block_trajectory is not None:
+            # Convert to list if tensor
+            if isinstance(self.block_trajectory, torch.Tensor):
+                b_traj = self.block_trajectory.tolist()
+            else:
+                b_traj = self.block_trajectory
+                
             block_start = max(0, self.num_prompt_tokens - before_ntok)
-            start = min(block_start, block_len)
-            if start < block_len:
-                self.trajectory.extend(self.block_trajectory[start:block_len])
+            start_idx = min(block_start, block_len)
+            if start_idx < block_len:
+                self.trajectory.extend(b_traj[start_idx:block_len])
+                
                 if self.block_logprobs is not None:
-                    self.logprobs.extend(self.block_logprobs[start:block_len])
+                    if isinstance(self.block_logprobs, torch.Tensor):
+                        b_logprobs = self.block_logprobs.tolist()
+                    else:
+                        b_logprobs = self.block_logprobs
+                    self.logprobs.extend(b_logprobs[start_idx:block_len])
+                    
                 if self.block_entropies is not None:
-                    self.entropies.extend(self.block_entropies[start:block_len])
- 
-            self.block_trajectory = None
-            self.block_logprobs = None
+                    if isinstance(self.block_entropies, torch.Tensor):
+                        b_entropies = self.block_entropies.tolist()
+                    else:
+                        b_entropies = self.block_entropies
+                    self.entropies.extend(b_entropies[start_idx:block_len])
+
+            # Resetting to None/Zero is handled in start_new_block or implicitly
 
         if self.num_tokens >= self.num_prompt_tokens + self.max_tokens:
              self.status = SequenceStatus.FINISHED
@@ -210,6 +233,7 @@ class Sequence:
         self.token_ids.append(token_id)
         self.last_token = token_id
         self.num_tokens += 1
+        self.token_counts[token_id] += 1
 
     def __getstate__(self):
         # Simplified for multiprocessing; customize as needed
