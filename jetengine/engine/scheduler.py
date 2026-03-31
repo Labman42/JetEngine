@@ -573,6 +573,13 @@ class Scheduler:
             # --- Deferred entropy: only compute for transferred positions ---
             final_transfer_index = transfer_index & mask_token_mask
 
+            # Lazy entropy: skip computation in chain intermediate steps for non-entropy strategies
+            # Entropy is only used for: (1) entropy_bounded strategy, (2) recording in committed blocks
+            # For non-entropy strategies, use zeros during chain and compute at SAVING step
+            can_skip_entropy = (not needs_entropy and chain_state is not None and
+                                chain_state.get('cpu_step', None) is not None and
+                                chain_state['cpu_step'] + 1 < _s[0].denoising_steps)
+
             if needs_entropy and strategy == "entropy_bounded":
                 # entropy_bounded needs entropy BEFORE transfer_index is decided
                 if use_dense:
@@ -602,6 +609,9 @@ class Scheduler:
                 transfer_index.scatter_(1, order[:, :block_len], k_mask)
                 transfer_index &= mask_token_mask
                 final_transfer_index = transfer_index & mask_token_mask
+            elif can_skip_entropy:
+                # Lazy entropy: skip computation in chain intermediate steps
+                entropies_all = batch_entropies  # reuse previous (zeros propagate)
             else:
                 # Compute entropy (sparse when not all masked)
                 if use_dense:
