@@ -21,6 +21,13 @@ try:
 except ImportError:
     _FLASHINFER_AVAILABLE = False
 
+try:
+    from flash_attn_3.flash_attn_interface import flash_attn_with_kvcache as _fa3_test
+    _FA3_AVAILABLE = True
+    del _fa3_test
+except ImportError:
+    _FA3_AVAILABLE = False
+
 
 def quantize_model_fp8(model: torch.nn.Module):
     """Quantize all linear layers to static FP8 (weights pre-quantized, activations cast inline).
@@ -89,15 +96,19 @@ class ModelRunner:
     def _init_flashinfer(self):
         """Initialize flashinfer wrappers for denoise attention acceleration.
         Creates one wrapper per batch size (1..fi_max_bs) with use_cuda_graph=True.
-        Larger batches fall back to flash_attn."""
-        self._use_flashinfer = _FLASHINFER_AVAILABLE
+        Larger batches fall back to flash_attn.
+        Skipped entirely when FA3 is available (FA3 handles paged attention directly)."""
+        self._use_flashinfer = _FLASHINFER_AVAILABLE and not _FA3_AVAILABLE
         self._fi_wrappers = {}
         self._fi_bufs = {}
+        if _FA3_AVAILABLE:
+            print(f"[FA3] Flash Attention 3 available, skipping flashinfer init (saves ~9.5 GiB)")
+            return
         if not self._use_flashinfer:
             return
 
-        # Cap flashinfer wrappers: each wrapper uses ~74 MiB of GPU memory
-        # 128 wrappers ≈ 9.5 GiB, feasible on H200 (140 GiB)
+        # Cap flashinfer wrappers at 128: each graph+wrapper pair uses ~73 MiB,
+        # 128 wrappers ≈ 9.5 GiB. H200 (140 GiB) is memory-bound at bs=128.
         fi_max_bs = min(self.config.max_num_seqs, 128)
         max_bs = min(self.config.max_num_seqs, 256)
         block_len = self.config.block_length
@@ -648,8 +659,8 @@ class ModelRunner:
     @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config
-        # Cap graph captures at flashinfer wrapper limit (saves memory for unused batch sizes)
-        fi_cap = 128 if self._use_flashinfer else 256
+        # Cap at 128 (FA3/flashinfer work best at this range)
+        fi_cap = 128 if (self._use_flashinfer or _FA3_AVAILABLE) else 256
         max_bs = min(self.config.max_num_seqs, fi_cap)
         max_global_bs = max_bs * self.config.block_length
         max_num_blocks = math.ceil(

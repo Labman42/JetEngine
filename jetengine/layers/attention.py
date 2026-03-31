@@ -10,6 +10,12 @@ from jetengine.kernels.triton.attention import sparse_attn_varlen
 # from jetengine.kernels.triton.attention import fused_kv_cache_attention_v5
 from flash_attn import flash_attn_with_kvcache, flash_attn_varlen_func
 
+try:
+    from flash_attn_3.flash_attn_interface import flash_attn_with_kvcache as fa3_flash_attn_with_kvcache
+    _FA3_AVAILABLE = True
+except ImportError:
+    _FA3_AVAILABLE = False
+
 
 @triton.jit
 def store_kvcache_kernel(
@@ -89,6 +95,15 @@ class BlockAttention(Attention):
                                 cu_seqlens_q=context.cu_seqlens_q,
                                 cu_seqlens_k=context.cu_seqlens_k,
                                 staircase_size=context.block_length)
+        elif _FA3_AVAILABLE and context.block_tables is not None:
+            # FA3 path: combined KV cache write + paged attention in one kernel
+            q = q.view(-1, context.block_length, self.num_heads, self.head_dim)
+            k = k.view(-1, context.block_length, self.num_kv_heads, self.head_dim)
+            v = v.view(-1, context.block_length, self.num_kv_heads, self.head_dim)
+            o = fa3_flash_attn_with_kvcache(q, k_cache, v_cache, k=k, v=v,
+                                            cache_seqlens=context.context_lens,
+                                            page_table=context.block_tables,
+                                            causal=False)
         elif context.fi_wrapper is not None:
             # flashinfer path: write KV to cache, then attend
             store_kvcache(k, v, k_cache, v_cache, context.fi_slot_mapping)
