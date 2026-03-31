@@ -31,6 +31,8 @@ class Config:
     mask_token_id: int = -1
     block_length: int = 4
     dtype: str = 'auto'
+    quantize_fp8: bool = False
+    torch_compile: bool = False
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

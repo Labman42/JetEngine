@@ -71,7 +71,7 @@ class BlockAttention(Attention):
         num_kv_heads,
     ):
         super().__init__(num_heads, head_dim, scale, num_kv_heads)
-    
+
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         o: torch.Tensor
         q = q.view(-1, self.num_heads, self.head_dim)
@@ -83,12 +83,16 @@ class BlockAttention(Attention):
         should_store_whole = (context.run_type == RunType.PREFILL)
         if should_store_whole and k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
-            
+
         if context.run_type == RunType.PREFILL:
             o = sparse_attn_varlen(q, k, v,
                                 cu_seqlens_q=context.cu_seqlens_q,
                                 cu_seqlens_k=context.cu_seqlens_k,
                                 staircase_size=context.block_length)
+        elif context.fi_wrapper is not None:
+            # flashinfer path: write KV to cache, then attend
+            store_kvcache(k, v, k_cache, v_cache, context.fi_slot_mapping)
+            o = context.fi_wrapper.run(q, (k_cache, v_cache))
         else:
             q = q.view(-1, context.block_length, self.num_heads, self.head_dim)
             k = k.view(-1, context.block_length, self.num_kv_heads, self.head_dim)
@@ -96,7 +100,7 @@ class BlockAttention(Attention):
             o = flash_attn_with_kvcache(q, k_cache=k_cache, v_cache=v_cache, k=k, v=v,
                                         cache_seqlens=context.context_lens,
                                         block_table=context.block_tables,
-                                        causal=False)  # Assuming non-causal for benchmark consistency     
+                                        causal=False)
         o = o.view(-1, self.num_heads * self.head_dim)
         return o
     

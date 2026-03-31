@@ -3,10 +3,31 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
+# FP8 e4m3fn max representable value
+_FP8_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
+
 
 def divide(numerator, denominator):
     assert numerator % denominator == 0
     return numerator // denominator
+
+
+def _fp8_linear(x: torch.Tensor, weight_fp8: torch.Tensor, weight_scale: torch.Tensor,
+                input_scale: torch.Tensor, input_inv_scale: torch.Tensor,
+                bias: torch.Tensor | None = None) -> torch.Tensor:
+    """FP8 linear: scale activation, cast to fp8, scaled_mm, optional bias.
+    Uses a fixed per-layer activation scale (no dynamic amax computation)."""
+    # Scale activations to use more of FP8 dynamic range, then cast
+    x_scaled = (x * input_scale).to(torch.float8_e4m3fn)
+    out = torch._scaled_mm(
+        x_scaled, weight_fp8.t(),
+        scale_a=input_inv_scale,
+        scale_b=weight_scale,
+        out_dtype=x.dtype,
+    )
+    if bias is not None:
+        out = out + bias
+    return out
 
 
 class LinearBase(nn.Module):
@@ -26,6 +47,27 @@ class LinearBase(nn.Module):
         # Use the process group to get the correct rank and size
         self.tp_rank = dist.get_rank(group=self.process_group)
         self.tp_size = dist.get_world_size(group=self.process_group)
+        self._use_fp8 = False
+
+    def quantize_to_fp8(self):
+        """Convert weight to FP8 with per-tensor scale. Call after weight loading.
+        Also sets a fixed activation scale based on typical RMSNorm output range."""
+        if not hasattr(self, 'weight') or self.weight is None:
+            return
+        w = self.weight.data.float()
+        amax = w.abs().max().clamp(min=1e-12)
+        scale = (_FP8_MAX / amax).to(torch.float32)
+        w_scaled = (w * scale).clamp(-_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
+        # Replace weight with fp8 (non-Parameter to save memory)
+        self.weight = nn.Parameter(w_scaled, requires_grad=False)
+        self.register_buffer('weight_scale', (1.0 / scale).reshape(1).to(torch.float32))
+        # Fixed activation scale: conservative value to avoid clipping.
+        # RMSNorm outputs: std~1, range [-5,5]. MLP intermediates: range [-30,30].
+        # Scale 15 maps [-30, 30] to [-450, 450], near FP8 max (448).
+        act_scale_val = 15.0
+        self.register_buffer('input_scale', torch.tensor(act_scale_val, dtype=torch.bfloat16))
+        self.register_buffer('input_inv_scale', torch.tensor(1.0 / act_scale_val, dtype=torch.float32))
+        self._use_fp8 = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
@@ -85,6 +127,9 @@ class ColumnParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._use_fp8:
+            return _fp8_linear(x, self.weight, self.weight_scale,
+                              self.input_scale, self.input_inv_scale, self.bias)
         return F.linear(x, self.weight, self.bias)
 
 
@@ -176,7 +221,12 @@ class RowParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
+        bias = self.bias if self.tp_rank == 0 else None
+        if self._use_fp8:
+            y = _fp8_linear(x, self.weight, self.weight_scale,
+                           self.input_scale, self.input_inv_scale, bias)
+        else:
+            y = F.linear(x, self.weight, bias)
         if self.tp_size > 1:
             dist.all_reduce(y, group=self.process_group)
         return y

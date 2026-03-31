@@ -108,9 +108,8 @@ class Sequence:
 
     def start_new_block(self):
         self.current_denoising_step = 0
-        # Reset tensors. We can reuse memory or create new ones. Creating new ones is safer for now.
-        # Ensure they are on the same device as before if possible, but for now CPU/default is fine
-        # as they will be moved to GPU in scheduler.
+        # Allocate new tensors to break any shared views from postprocess batch tensors.
+        # Using .clone() + fill_() or new allocation prevents corrupting batch views.
         device = self.intermediate_block_tokens.device
         self.intermediate_block_tokens = torch.full((self.block_length,), self.mask_token_id, dtype=torch.long, device=device)
         self.intermediate_block_tokens_entropy = torch.zeros(self.block_length, dtype=torch.float, device=device)
@@ -193,6 +192,47 @@ class Sequence:
 
         if self.num_tokens >= self.num_prompt_tokens + self.max_tokens:
              self.status = SequenceStatus.FINISHED
+
+    def _commit_block_from_cpu(self, block_tokens: list[int], b_traj: list, b_logprobs: list, b_entropies: list):
+        """commit_block variant that accepts pre-converted CPU lists (avoids per-seq GPU sync)."""
+        start = self.generation_start_index
+        remaining = self.max_tokens - self.num_completion_tokens
+        if remaining <= 0:
+            self.status = SequenceStatus.FINISHED
+            return
+
+        stop_pos = None
+        if (not self.ignore_eos) and self.stop_words:
+            stop_pos = next(
+                (j for j, tok in enumerate(block_tokens[start:], start)
+                if tok in self.stop_words),
+                None
+            )
+
+        end_by_tokens = start + remaining
+        end_by_stop = (stop_pos + 1) if stop_pos is not None else len(block_tokens)
+        end = min(len(block_tokens), end_by_tokens, end_by_stop)
+
+        if end == end_by_tokens or (stop_pos is not None and end == stop_pos + 1):
+            self.status = SequenceStatus.FINISHED
+        self.generation_start_index = 0
+
+        before_ntok = self.num_tokens
+        self.token_ids.extend(block_tokens)
+        self.num_tokens = len(self.token_ids)
+        self.num_generated_tokens = self.num_tokens - self.num_prompt_tokens
+        self.token_counts.update(block_tokens)
+
+        block_len = len(block_tokens)
+        block_start = max(0, self.num_prompt_tokens - before_ntok)
+        start_idx = min(block_start, block_len)
+        if start_idx < block_len:
+            self.trajectory.extend(b_traj[start_idx:block_len])
+            self.logprobs.extend(b_logprobs[start_idx:block_len])
+            self.entropies.extend(b_entropies[start_idx:block_len])
+
+        if self.num_tokens >= self.num_prompt_tokens + self.max_tokens:
+            self.status = SequenceStatus.FINISHED
 
     def get_len_for_next_step(self):
         return self.num_tokens + self.block_length

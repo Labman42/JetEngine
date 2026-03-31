@@ -10,7 +10,7 @@ from contextlib import nullcontext
 
 from jetengine.config import Config
 from jetengine.sampling_params import SamplingParams
-from jetengine.engine.sequence import Sequence, RunType
+from jetengine.engine.sequence import Sequence, RunType, SequenceStatus
 from jetengine.engine.scheduler import Scheduler
 from jetengine.engine.model_runner import ModelRunner
 from jetengine.utils.loader import load_from_hf_model
@@ -49,6 +49,10 @@ class LLMEngine:
         self.config = config
         self.scheduler = Scheduler(config)
         self.scheduler.consistent_sampling_params = False
+        # Chain statistics for diagnostics
+        self._chain_attempts = 0
+        self._chain_successes = 0
+        self._chain_depth_counts = {}  # max_chain -> count
         atexit.register(self.exit)
 
     def offload_parameters(self, include_buffers: bool = False):
@@ -193,13 +197,73 @@ class LLMEngine:
 
         tokens_generated = 0
         if schedule_result.denoise:
-            logits = self.model_runner.run(schedule_result.denoise, RunType.DENOISE)
-            finished_sequences.extend(
-                postprocess_fn(schedule_result.denoise, logits, RunType.DENOISE)
-            )
-            tokens_generated = sum(
-                getattr(seq, "num_to_transfer", 0) for seq in schedule_result.denoise
-            )
+            denoise_seqs = schedule_result.denoise
+            bs = len(denoise_seqs)
+            # Adaptive chain depth:
+            # - Small batches (tail): chain=4 for maximum throughput
+            # - Large batches with no pending work: chain=5 (full block in one step)
+            # - Large batches with pending prefills: chain=2 (let scheduler refill)
+            has_pending = (len(self.scheduler.waiting_prefill) > 0 or
+                          len(self.scheduler.prefill_ready) > 0)
+            if bs <= 8:
+                max_chain = 4
+            elif not has_pending:
+                max_chain = 5  # full block in one step when nothing is waiting
+            else:
+                max_chain = 2
+            self._chain_depth_counts[max_chain] = self._chain_depth_counts.get(max_chain, 0) + 1
+            _context_valid = False  # Track whether positions/block_tables can be reused
+            _prev_bs = bs  # Track batch size for context reuse validation
+            _chain_state = None  # Batch tensor state for chain reuse
+            for _chain_step in range(max_chain):
+                num_denoising = sum(1 for s in denoise_seqs if s.status == SequenceStatus.DENOISING)
+                num_need_logits = num_denoising if num_denoising < len(denoise_seqs) else None
+                # Reuse context (positions/block_tables) for pure DENOISING chain steps
+                # Context becomes invalid when sequences commit blocks (SAVING) or batch changes
+                reuse = _context_valid and num_need_logits is None
+                # Pass batch tokens directly from chain_state to avoid loop+cat in prepare_denoise
+                _chain_tokens = _chain_state['tokens'] if _chain_state is not None and reuse else None
+                logits = self.model_runner.run(denoise_seqs, RunType.DENOISE,
+                                               num_need_logits=num_need_logits,
+                                               reuse_context=reuse,
+                                               chain_batch_tokens=_chain_tokens)
+                finished_sequences.extend(
+                    postprocess_fn(denoise_seqs, logits, RunType.DENOISE,
+                                   chain_state=_chain_state)
+                )
+                # Get chain_state from scheduler (set during postprocess_unify)
+                _chain_state = getattr(self.scheduler, '_chain_state_out', None)
+                if _chain_state is not None and hasattr(denoise_seqs[-1], '_chain_total_transferred'):
+                    tokens_generated += denoise_seqs[-1]._chain_total_transferred
+                else:
+                    tokens_generated += sum(
+                        getattr(seq, "num_to_transfer", 0) for seq in denoise_seqs
+                    )
+                if _chain_step < max_chain - 1:
+                    self._chain_attempts += 1
+                    # Filter out finished sequences (blocks already deallocated)
+                    denoise_seqs = [s for s in denoise_seqs if s.status in
+                                    (SequenceStatus.DENOISING, SequenceStatus.SAVING)]
+                    if not denoise_seqs:
+                        break
+                    # Allocate any new KV blocks needed by just-committed sequences
+                    if not self.scheduler.try_allocate_chain_blocks(denoise_seqs):
+                        _context_valid = False
+                        _chain_state = None
+                        break
+                    new_bs = len(denoise_seqs)
+                    has_saving = any(s.status == SequenceStatus.SAVING for s in denoise_seqs)
+                    # Context valid only if same batch size, same sequences, all DENOISING
+                    if has_saving or new_bs != _prev_bs:
+                        _context_valid = False
+                        _chain_state = None  # Batch changed, can't reuse chain state
+                        if has_saving:
+                            # Re-sort: DENOISING first, SAVING last (for selective logits)
+                            denoise_seqs.sort(key=lambda s: 0 if s.status == SequenceStatus.DENOISING else 1)
+                    else:
+                        _context_valid = True
+                    _prev_bs = new_bs
+                    self._chain_successes += 1
 
         # Deduplicate by sequence id to avoid returning the same sequence twice
         seen_seq_ids = set()
@@ -403,8 +467,8 @@ class LLMEngine:
                 token_ids = [self.tokenizer.eos_token_id]
                 text = self.tokenizer.decode(token_ids)
             safe_outputs.append({
-                "text": text, 
-                "token_ids": token_ids, 
+                "text": text,
+                "token_ids": token_ids,
                 "trajectory": trajectory,
                 "logprobs": logprobs,  # NEW
                 "entropies": entropies  # NEW
@@ -412,4 +476,10 @@ class LLMEngine:
 
         if use_tqdm:
             pbar.close()
+        elapsed = perf_counter() - start_time
+        depth_str = " ".join(f"d{k}={v}" for k, v in sorted(self._chain_depth_counts.items()))
+        print(f"[Chain] attempts={self._chain_attempts} successes={self._chain_successes} "
+              f"hit_rate={self._chain_successes/max(self._chain_attempts,1)*100:.1f}% "
+              f"depths=[{depth_str}] "
+              f"wall={elapsed:.1f}s tok/s={total_generated_tokens/max(elapsed,1e-9):.0f}")
         return safe_outputs
