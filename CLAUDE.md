@@ -227,6 +227,7 @@ Note: Profiling sync overhead inflates total time (4.5s vs 3.3s unprofiled). Pro
 | opt19 | bs=128 verified | 0.708 | 4109 |
 | opt20 | GPU sync elimination, chain batch tokens | 0.705 | 4114 |
 | opt21 | Sparse sampling (only masked positions) | 0.722 | 4180 |
+| opt22 | Lazy entropy (skip in chain intermediate) | 0.709 | 4242 |
 
 ### Ruled-Out Optimizations
 

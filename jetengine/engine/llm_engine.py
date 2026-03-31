@@ -223,13 +223,28 @@ class LLMEngine:
                 reuse = _context_valid and num_need_logits is None
                 # Pass batch tokens directly from chain_state to avoid loop+cat in prepare_denoise
                 _chain_tokens = _chain_state['tokens'] if _chain_state is not None and reuse else None
+                # Sparse logits: only compute LM head for masked positions (steps 1+)
+                _masked_idx = None
+                if (_chain_state is not None and _chain_state.get('cpu_step', 0) >= 1
+                        and num_need_logits is None):
+                    _mask = (_chain_state['tokens'] == self.config.mask_token_id).view(-1)
+                    _masked_idx = _mask.nonzero(as_tuple=True)[0]
+                    # Need enough masked positions for flashinfer kernels
+                    if _masked_idx.shape[0] < 8:
+                        _masked_idx = None
                 logits = self.model_runner.run(denoise_seqs, RunType.DENOISE,
                                                num_need_logits=num_need_logits,
                                                reuse_context=reuse,
-                                               chain_batch_tokens=_chain_tokens)
+                                               chain_batch_tokens=_chain_tokens,
+                                               masked_indices=_masked_idx)
+                # Pass sparse logits info to postprocess via chain_state
+                _pp_chain = _chain_state
+                if _masked_idx is not None and _pp_chain is not None:
+                    _pp_chain = dict(_pp_chain)  # shallow copy to avoid mutation
+                    _pp_chain['sparse_logits_indices'] = _masked_idx
                 finished_sequences.extend(
                     postprocess_fn(denoise_seqs, logits, RunType.DENOISE,
-                                   chain_state=_chain_state)
+                                   chain_state=_pp_chain)
                 )
                 # Get chain_state from scheduler (set during postprocess_unify)
                 _chain_state = getattr(self.scheduler, '_chain_state_out', None)

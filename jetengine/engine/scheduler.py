@@ -421,10 +421,19 @@ class Scheduler:
             mask_token_mask = (batch_current_tokens == self.mask_token_id)
 
             # --- Softmax + Sampling (sparse: only masked positions) ---
-            d_logits_3d = logits.view(d_batch_size, block_len, -1)
-            d_logits = d_logits_3d.reshape(-1, d_logits_3d.shape[-1])
-            vocab_size = d_logits.shape[-1]
+            # Check if logits are already sparse (computed only for masked positions)
+            sparse_logits_indices = chain_state.get('sparse_logits_indices', None) if chain_state is not None else None
             flat_mask = mask_token_mask.view(-1)
+
+            if sparse_logits_indices is not None:
+                # Logits are already sparse — no need to reshape to (batch, block_len, vocab)
+                vocab_size = logits.shape[-1]
+                d_logits = logits  # already (num_masked, vocab_size)
+            else:
+                d_logits_3d = logits.view(d_batch_size, block_len, -1)
+                d_logits = d_logits_3d.reshape(-1, d_logits_3d.shape[-1])
+                vocab_size = d_logits.shape[-1]
+
             # Predict all_masked from CPU-side state to avoid GPU→CPU sync
             if chain_state is not None:
                 cpu_step = chain_state.get('cpu_step', None)
@@ -433,8 +442,23 @@ class Scheduler:
                 # First step: all positions start masked
                 all_masked = all(seq.current_denoising_step == 0 for seq in _s)
 
-            # Use dense path when all masked or batch too small for flashinfer sparse kernel
-            use_dense = all_masked or d_batch_size * block_len < 8
+            # Use dense path when all masked or too few masked positions for flashinfer kernel
+            # Never use dense when logits are already sparse from model_runner
+            if sparse_logits_indices is not None:
+                use_dense = False  # logits already sparse, must use sparse path
+            elif all_masked:
+                use_dense = True
+            elif d_batch_size * block_len < 8:
+                use_dense = True  # total positions too few for flashinfer
+            else:
+                # Predict masked count from CPU-side state to avoid GPU sync
+                if chain_state is not None and chain_state.get('cpu_step') is not None:
+                    predicted_masked = d_batch_size * max(1, block_len - chain_state['cpu_step'])
+                else:
+                    # Fallback: estimate from sequence state (only for small batches)
+                    min_remaining = min((block_len - seq.current_denoising_step) for seq in _s)
+                    predicted_masked = d_batch_size * max(1, min_remaining)
+                use_dense = predicted_masked < 8
 
             if use_dense:
                 # Dense path: all positions masked (first denoising step), no gather/scatter overhead
@@ -449,8 +473,13 @@ class Scheduler:
                 batch_seq_x0_logp = torch.log(batch_seq_x0_p.clamp_min(EPS))
             else:
                 # Sparse path: only process masked positions
-                masked_indices = flat_mask.nonzero(as_tuple=True)[0]
-                sparse_logits = d_logits[masked_indices]
+                if sparse_logits_indices is not None:
+                    # Logits already sparse from model_runner — use directly
+                    masked_indices = sparse_logits_indices
+                    sparse_logits = d_logits  # already (num_masked, vocab_size)
+                else:
+                    masked_indices = flat_mask.nonzero(as_tuple=True)[0]
+                    sparse_logits = d_logits[masked_indices]
                 sparse_probs = self.sample_pipe(sparse_logits, temperature=_s[0].temperature)
 
                 # Apply repetition penalty on sparse probs (need per-sequence mapping)

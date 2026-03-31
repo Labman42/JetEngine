@@ -529,6 +529,7 @@ class ModelRunner:
         positions: torch.Tensor,
         num_need_logits: int = None,
         reuse_context: bool = False,
+        masked_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, bool]:
         if (
             self.enforce_eager
@@ -603,13 +604,16 @@ class ModelRunner:
         # Only compute logits for sequences that need them (DENOISING first in batch)
         if num_need_logits is not None and num_need_logits < batch_size:
             logits_len = num_need_logits * block_len
-            logits = self.model.compute_logits(hidden[:logits_len])
-        else:
-            logits = self.model.compute_logits(hidden)
+            hidden = hidden[:logits_len]
+        # Sparse logits: only compute LM head for masked positions
+        if masked_indices is not None:
+            hidden = hidden[masked_indices]
+        logits = self.model.compute_logits(hidden)
         return logits, True
 
     def run(self, seqs: list[Sequence], run_type: RunType, num_need_logits: int = None,
-            reuse_context: bool = False, chain_batch_tokens: torch.Tensor | None = None) -> torch.Tensor:
+            reuse_context: bool = False, chain_batch_tokens: torch.Tensor | None = None,
+            masked_indices: torch.Tensor | None = None) -> torch.Tensor:
         if run_type == RunType.PREFILL:
             input_ids, positions = self.prepare_prefill(seqs)
         elif run_type == RunType.DENOISE:
@@ -625,7 +629,7 @@ class ModelRunner:
         if run_type == RunType.DENOISE and not self.enforce_eager:
             logits, used_graph = self._run_denoise_with_cudagraph(
                 seqs, input_ids, positions, num_need_logits=num_need_logits,
-                reuse_context=reuse_context,
+                reuse_context=reuse_context, masked_indices=masked_indices,
             )
             if not used_graph:
                 if need_selective:
