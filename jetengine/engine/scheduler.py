@@ -443,9 +443,10 @@ class Scheduler:
                 all_masked = all(seq.current_denoising_step == 0 for seq in _s)
 
             # Use dense path when all masked or too few masked positions for flashinfer kernel
-            # Never use dense when logits are already sparse from model_runner
+            # When logits are already sparse from model_runner, always use sparse path
+            # (small-batch safety handled inside sparse path with PyTorch softmax fallback)
             if sparse_logits_indices is not None:
-                use_dense = False  # logits already sparse, must use sparse path
+                use_dense = False
             elif all_masked:
                 use_dense = True
             elif d_batch_size * block_len < 8:
@@ -462,12 +463,18 @@ class Scheduler:
 
             if use_dense:
                 # Dense path: all positions masked (first denoising step), no gather/scatter overhead
-                probs = self.sample_pipe(d_logits, temperature=_s[0].temperature).view(d_batch_size, block_len, -1)
+                if d_logits.shape[0] < 8:
+                    probs = torch.softmax(d_logits.float() / _s[0].temperature, dim=-1).to(d_logits.dtype).view(d_batch_size, block_len, -1)
+                else:
+                    probs = self.sample_pipe(d_logits, temperature=_s[0].temperature).view(d_batch_size, block_len, -1)
                 self.apply_repetition_penalty(probs, _s)
                 flat_probs = probs.view(-1, vocab_size)
-                flat_samples = top_k_top_p_sampling_from_probs(
-                    flat_probs, top_k=_s[0].top_k, top_p=_s[0].top_p
-                ).to(torch.int64)
+                if flat_probs.shape[0] < 8:
+                    flat_samples = torch.multinomial(flat_probs, num_samples=1).squeeze(-1).to(torch.int64)
+                else:
+                    flat_samples = top_k_top_p_sampling_from_probs(
+                        flat_probs, top_k=_s[0].top_k, top_p=_s[0].top_p
+                    ).to(torch.int64)
                 batch_seq_x0 = flat_samples.view(d_batch_size, block_len)
                 batch_seq_x0_p = torch.gather(flat_probs, 1, flat_samples.unsqueeze(-1)).view(d_batch_size, block_len)
                 batch_seq_x0_logp = torch.log(batch_seq_x0_p.clamp_min(EPS))
@@ -480,7 +487,11 @@ class Scheduler:
                 else:
                     masked_indices = flat_mask.nonzero(as_tuple=True)[0]
                     sparse_logits = d_logits[masked_indices]
-                sparse_probs = self.sample_pipe(sparse_logits, temperature=_s[0].temperature)
+                if sparse_logits.shape[0] < 8:
+                    # PyTorch fallback: flashinfer OnlineSoftmax crashes for < 8 rows
+                    sparse_probs = torch.softmax(sparse_logits.float() / _s[0].temperature, dim=-1).to(sparse_logits.dtype)
+                else:
+                    sparse_probs = self.sample_pipe(sparse_logits, temperature=_s[0].temperature)
 
                 # Apply repetition penalty on sparse probs (need per-sequence mapping)
                 if any(seq.repetition_penalty != 1.0 and seq.num_tokens > seq.max_tokens // 2 for seq in _s):
@@ -496,9 +507,13 @@ class Scheduler:
                             sparse_probs[row_indices[:, None], torch.tensor(seen_tokens, device=device)] /= seq.repetition_penalty
                             sparse_probs[row_indices] /= sparse_probs[row_indices].sum(dim=-1, keepdim=True)
 
-                sparse_samples = top_k_top_p_sampling_from_probs(
-                    sparse_probs, top_k=_s[0].top_k, top_p=_s[0].top_p
-                ).to(torch.int64)
+                if sparse_probs.shape[0] < 8:
+                    # PyTorch fallback for small batches (flashinfer sampling kernel minimum)
+                    sparse_samples = torch.multinomial(sparse_probs, num_samples=1).squeeze(-1).to(torch.int64)
+                else:
+                    sparse_samples = top_k_top_p_sampling_from_probs(
+                        sparse_probs, top_k=_s[0].top_k, top_p=_s[0].top_p
+                    ).to(torch.int64)
                 sparse_x0_p = torch.gather(sparse_probs, 1, sparse_samples.unsqueeze(-1)).squeeze(-1)
 
                 # Scatter back to full (batch_size, block_len) shape
