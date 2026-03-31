@@ -12,9 +12,13 @@ from flash_attn import flash_attn_with_kvcache, flash_attn_varlen_func
 
 try:
     from flash_attn_3.flash_attn_interface import flash_attn_with_kvcache as fa3_flash_attn_with_kvcache
+    from flash_attn_3.flash_attn_interface import flash_attn_varlen_func as fa3_flash_attn_varlen_func
     _FA3_AVAILABLE = True
 except ImportError:
     _FA3_AVAILABLE = False
+
+import os
+_FA3_PREFILL = _FA3_AVAILABLE and os.environ.get("JETENGINE_FA3_PREFILL", "0") == "1"
 
 
 @triton.jit
@@ -90,7 +94,15 @@ class BlockAttention(Attention):
         if should_store_whole and k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
 
-        if context.run_type == RunType.PREFILL:
+        if context.run_type == RunType.PREFILL and _FA3_PREFILL:
+            # FA3 causal prefill (replaces staircase with causal mask)
+            max_seqlen_q = (context.cu_seqlens_q[1:] - context.cu_seqlens_q[:-1]).max().item()
+            max_seqlen_k = (context.cu_seqlens_k[1:] - context.cu_seqlens_k[:-1]).max().item()
+            o = fa3_flash_attn_varlen_func(q, k, v,
+                                context.cu_seqlens_q, context.cu_seqlens_k,
+                                max_seqlen_q, max_seqlen_k,
+                                causal=True)
+        elif context.run_type == RunType.PREFILL:
             o = sparse_attn_varlen(q, k, v,
                                 cu_seqlens_q=context.cu_seqlens_q,
                                 cu_seqlens_k=context.cu_seqlens_k,

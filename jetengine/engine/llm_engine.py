@@ -202,7 +202,7 @@ class LLMEngine:
             # Adaptive chain depth:
             # - Small batches (tail): chain=4 for maximum throughput
             # - Large batches with no pending work: chain=5 (full block in one step)
-            # - Large batches with pending prefills: chain=2 (let scheduler refill)
+            # - Large batches with pending prefills: chain=3 (balance throughput vs refill latency)
             has_pending = (len(self.scheduler.waiting_prefill) > 0 or
                           len(self.scheduler.prefill_ready) > 0)
             if bs <= 8:
@@ -210,7 +210,7 @@ class LLMEngine:
             elif not has_pending:
                 max_chain = 5  # full block in one step when nothing is waiting
             else:
-                max_chain = 2
+                max_chain = 3  # balance throughput vs prefill refill latency
             self._chain_depth_counts[max_chain] = self._chain_depth_counts.get(max_chain, 0) + 1
             _context_valid = False  # Track whether positions/block_tables can be reused
             _prev_bs = bs  # Track batch size for context reuse validation

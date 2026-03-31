@@ -128,7 +128,7 @@ Custom tensor-parallel layers: `QKVParallelLinear`, `MergedColumnParallelLinear`
 Optimized operations:
 - `RMSNorm` — `@torch.compile` with fused residual add
 - `SiluAndMul` — `@torch.compile` with liger-kernel
-- Attention — flashinfer for denoise (paged KV, CUDA graph compatible), Triton sparse attention for prefill
+- Attention — FA3 (Flash Attention 3, Hopper SM90) for denoise (paged KV, CUDA graph compatible), flashinfer fallback, Triton sparse attention for prefill
 
 ### Kernels (`jetengine/kernels/triton/`)
 
@@ -228,22 +228,33 @@ Note: Profiling sync overhead inflates total time (4.5s vs 3.3s unprofiled). Pro
 | opt20 | GPU sync elimination, chain batch tokens | 0.705 | 4114 |
 | opt21 | Sparse sampling (only masked positions) | 0.722 | 4180 |
 | opt22 | Lazy entropy (skip in chain intermediate) | 0.709 | 4242 |
+| opt23 | Sparse logits (LM head only masked positions) | 0.711 | 4268 |
+| opt24 | FA3 (Flash Attention 3, Hopper SM90) | 0.722 | 5677 |
+
+### Current Profile (H200, bs=128, opt24)
+
+Throughput: **5677 tok/s** (bench_throughput.py, bs=128, max_tokens=128)
+
+FA3 replaces flashinfer for denoise attention, combining KV cache write + paged attention in one kernel. Forward pass dominates, with cuBLAS GEMM as the main bottleneck.
 
 ### Ruled-Out Optimizations
 
-- **FP8 weight quantization**: 35% per-layer relative error compounds over 36 layers → NaN. FP8 e4m3fn has only 3 mantissa bits.
+- **FP8 weight quantization**: 35% per-layer relative error compounds over 36 layers → NaN. FP8 e4m3fn has only 3 mantissa bits. Tested with `torch._scaled_mm` (1.4-1.9x GEMM speedup) but quality loss is fundamental.
+- **INT8 via torch._int_mm**: 7-8x SLOWER than BF16 on H200. PyTorch's INT8 kernel is not optimized for Hopper architecture.
 - **torch.compile on decoder layers**: Incompatible with CUDA graph capture — attention layer's `get_context()` dynamic dispatch causes graph breaks.
 - **denoising_steps < 4**: Quality drops catastrophically (0.683 → 0.441 with steps=3).
 - **Skip SAVING forward pass**: Corrupts KV cache (pass@1 → 0.14).
 - **FP8 dynamic input quantization**: Overhead > GEMM savings for M ≤ 256.
+- **Fused sampling from logits**: flashinfer's `top_k_top_p_sampling_from_logits` is slower than separate pipe+sampling.
 
 ### Remaining Optimization Avenues
 
-- **Fused Triton postprocess kernel**: Fuse softmax+sampling+entropy into a single kernel for masked positions
-- **SmoothQuant FP8**: Per-channel weight + per-tensor activation (needs calibration)
-- **INT4 GPTQ/AWQ**: Major quality risk, needs calibration
-- **Tensor parallelism**: Near-linear scaling for multi-GPU
+- **Tensor parallelism**: Near-linear scaling for multi-GPU (most impactful remaining option)
+- **NVIDIA Transformer Engine FP8**: Proper FP8 with delayed scaling and amax history (not installed, needs `pip install transformer-engine`)
+- **Async postprocess overlap**: Run non-critical postprocess work on secondary CUDA stream while next forward starts (~1ms overlap potential)
+- **Fused Triton postprocess kernel**: Fuse softmax+sampling into single kernel (diminishing returns after sparse sampling)
 - **Larger block_length (8)**: 2x tokens/step but needs model retraining
+- **INT4 GPTQ/AWQ**: Needs calibration data + AutoGPTQ/AutoAWQ (not installed), major quality risk
 
 ## Development Workflow
 
@@ -289,5 +300,5 @@ Note: Profiling sync overhead inflates total time (4.5s vs 3.3s unprofiled). Pro
 - `jetengine/engine/sequence.py` — _commit_block_from_cpu, tensor-based block state
 - `jetengine/engine/llm_engine.py` — chain mechanism, adaptive chain depth, generate_streaming
 - `jetengine/layers/linear.py` — FP8 quantize_to_fp8 method, _fp8_linear function
-- `jetengine/layers/attention.py` — flashinfer path in BlockAttention.forward
+- `jetengine/layers/attention.py` — FA3 path (priority) + flashinfer fallback in BlockAttention.forward
 - `jetengine/config.py` — quantize_fp8, torch_compile flags
