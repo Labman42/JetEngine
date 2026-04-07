@@ -223,28 +223,13 @@ class LLMEngine:
                 reuse = _context_valid and num_need_logits is None
                 # Pass batch tokens directly from chain_state to avoid loop+cat in prepare_denoise
                 _chain_tokens = _chain_state['tokens'] if _chain_state is not None and reuse else None
-                # Sparse logits: only compute LM head for masked positions (steps 1+)
-                _masked_idx = None
-                if (_chain_state is not None and _chain_state.get('cpu_step', 0) >= 1
-                        and num_need_logits is None):
-                    _mask = (_chain_state['tokens'] == self.config.mask_token_id).view(-1)
-                    _masked_idx = _mask.nonzero(as_tuple=True)[0]
-                    # Need enough masked positions for flashinfer kernels
-                    if _masked_idx.shape[0] < 8:
-                        _masked_idx = None
                 logits = self.model_runner.run(denoise_seqs, RunType.DENOISE,
                                                num_need_logits=num_need_logits,
                                                reuse_context=reuse,
-                                               chain_batch_tokens=_chain_tokens,
-                                               masked_indices=_masked_idx)
-                # Pass sparse logits info to postprocess via chain_state
-                _pp_chain = _chain_state
-                if _masked_idx is not None and _pp_chain is not None:
-                    _pp_chain = dict(_pp_chain)  # shallow copy to avoid mutation
-                    _pp_chain['sparse_logits_indices'] = _masked_idx
+                                               chain_batch_tokens=_chain_tokens)
                 finished_sequences.extend(
                     postprocess_fn(denoise_seqs, logits, RunType.DENOISE,
-                                   chain_state=_pp_chain)
+                                   chain_state=_chain_state)
                 )
                 # Get chain_state from scheduler (set during postprocess_unify)
                 _chain_state = getattr(self.scheduler, '_chain_state_out', None)
@@ -299,7 +284,7 @@ class LLMEngine:
                 seq.entropies = seq.entropies[:response_len]
 
             finished_outputs.append(
-                (seq.seq_id, seq.token_ids, seq.trajectory, seq.logprobs, seq.entropies)
+                (seq.seq_id, seq.token_ids, seq.trajectory, seq.logprobs, seq.entropies, seq.all_step_signals)
             )
 
         return finished_outputs, tokens_generated
@@ -349,24 +334,26 @@ class LLMEngine:
                 pbar.set_postfix(
                     {"Throughput": f"{int(throughput)} tok/s"})
 
-            for seq_id, token_ids, trajectory, logprobs, entropies in output:  # Updated unpacking
+            for seq_id, token_ids, trajectory, logprobs, entropies, step_signals in output:
                 outputs[seq_id] = {
-                    "token_ids": token_ids, 
+                    "token_ids": token_ids,
                     "trajectory": trajectory,
-                    "logprobs": logprobs,  # NEW
-                    "entropies": entropies  # NEW
+                    "logprobs": logprobs,
+                    "entropies": entropies,
+                    "step_signals": step_signals,
                 }
                 if use_tqdm:
                     pbar.update(1)
 
         outputs = [outputs[seq_id] for seq_id in sorted(outputs)]
-        
+
         safe_outputs = []
         for output in outputs:
             token_ids = output["token_ids"]
             trajectory = output["trajectory"]
-            logprobs = output["logprobs"]  # NEW
-            entropies = output["entropies"]  # NEW
+            logprobs = output["logprobs"]
+            entropies = output["entropies"]
+            step_signals = output["step_signals"]
             try:
                 text = self.tokenizer.decode(token_ids)
             except Exception as e:
@@ -374,11 +361,12 @@ class LLMEngine:
                 token_ids = [self.tokenizer.eos_token_id]
                 text = self.tokenizer.decode(token_ids)
             safe_outputs.append({
-                "text": text, 
-                "token_ids": token_ids, 
+                "text": text,
+                "token_ids": token_ids,
                 "trajectory": trajectory,
-                "logprobs": logprobs,  # NEW
-                "entropies": entropies  # NEW
+                "logprobs": logprobs,
+                "entropies": entropies,
+                "step_signals": step_signals,
             })
         
         if use_tqdm:
@@ -414,6 +402,35 @@ class LLMEngine:
         if max_active is None:
             max_active = getattr(self.scheduler, "max_num_seqs", 32)
 
+        # Interleave duplicate prompts to ensure heterogeneous batches.
+        # Homogeneous batches (e.g., 64 copies of the same prompt in gen64) cause
+        # numerical instability in batched GEMM/attention kernels, leading to
+        # systematically different outputs vs heterogeneous batches. Round-robin
+        # through prompt groups so each batch contains diverse prompts.
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for i, p in enumerate(prompts):
+            key = tuple(p) if isinstance(p, list) else p
+            groups[key].append(i)
+        if any(len(g) > 1 for g in groups.values()):
+            interleaved_indices: list[int] = []
+            iters = [iter(g) for g in groups.values()]
+            while iters:
+                next_iters = []
+                for it in iters:
+                    try:
+                        interleaved_indices.append(next(it))
+                        next_iters.append(it)
+                    except StopIteration:
+                        pass
+                iters = next_iters
+            ordered_prompts = [prompts[i] for i in interleaved_indices]
+            ordered_sampling_params = [sampling_params[i] for i in interleaved_indices]
+        else:
+            interleaved_indices = list(range(total))
+            ordered_prompts = list(prompts)
+            ordered_sampling_params = list(sampling_params)
+
         if use_tqdm:
             pbar = tqdm(total=total, desc="Generating", dynamic_ncols=True)
 
@@ -421,10 +438,23 @@ class LLMEngine:
         pending_idx = 0
         stall_counter = 0
 
+        # Track seq_id -> original prompt index for output reordering at the end.
+        seq_to_orig: dict[int, int] = {}
+
+        def _add_request_tracked(prompt, sp, orig_idx):
+            self.add_request(prompt, sp)
+            # The Sequence just created has the highest seq_id; find it.
+            # add_request appends to either running or waiting_prefill.
+            if self.scheduler.waiting_prefill:
+                new_seq = self.scheduler.waiting_prefill[-1]
+            else:
+                new_seq = self.scheduler.running[-1]
+            seq_to_orig[new_seq.seq_id] = orig_idx
+
         # Prime initial requests up to capacity
         initial = min(max_active, total)
         for i in range(initial):
-            self.add_request(prompts[i], sampling_params[i])
+            _add_request_tracked(ordered_prompts[i], ordered_sampling_params[i], interleaved_indices[i])
         pending_idx = initial
 
         total_generated_tokens = 0
@@ -435,8 +465,9 @@ class LLMEngine:
             running = getattr(self.scheduler, "running", [])
             deficit = max_active - len(running)
             while deficit > 0 and pending_idx < total:
-                self.add_request(
-                    prompts[pending_idx], sampling_params[pending_idx])
+                _add_request_tracked(
+                    ordered_prompts[pending_idx], ordered_sampling_params[pending_idx],
+                    interleaved_indices[pending_idx])
                 pending_idx += 1
                 deficit -= 1
 
@@ -459,22 +490,29 @@ class LLMEngine:
                     {"Throughput": f"{int(throughput)} tok/s"})
                 pbar.update(len(output))
 
-            for seq_id, token_ids, trajectory, logprobs, entropies in output:  # Updated unpacking
+            for seq_id, token_ids, trajectory, logprobs, entropies, step_signals in output:
                 outputs[seq_id] = {
-                    "token_ids": token_ids, 
+                    "token_ids": token_ids,
                     "trajectory": trajectory,
-                    "logprobs": logprobs,  # NEW
-                    "entropies": entropies  # NEW
+                    "logprobs": logprobs,
+                    "entropies": entropies,
+                    "step_signals": step_signals,
                 }
 
-        outputs = [outputs[seq_id] for seq_id in sorted(outputs)]
-        
+        # Reorder outputs to match the original prompt order (undo interleaving)
+        outputs_by_orig_idx: dict[int, dict] = {}
+        for seq_id, out in outputs.items():
+            orig_idx = seq_to_orig.get(seq_id, seq_id)
+            outputs_by_orig_idx[orig_idx] = out
+        outputs = [outputs_by_orig_idx[i] for i in range(total)]
+
         safe_outputs = []
         for output in outputs:
             token_ids = output["token_ids"]
             trajectory = output["trajectory"]
-            logprobs = output["logprobs"]  # NEW
-            entropies = output["entropies"]  # NEW
+            logprobs = output["logprobs"]
+            entropies = output["entropies"]
+            step_signals = output["step_signals"]
             try:
                 text = self.tokenizer.decode(token_ids)
             except Exception as e:
@@ -485,8 +523,9 @@ class LLMEngine:
                 "text": text,
                 "token_ids": token_ids,
                 "trajectory": trajectory,
-                "logprobs": logprobs,  # NEW
-                "entropies": entropies  # NEW
+                "logprobs": logprobs,
+                "entropies": entropies,
+                "step_signals": step_signals,
             })
 
         if use_tqdm:

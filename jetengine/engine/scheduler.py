@@ -43,7 +43,25 @@ class Scheduler:
                                 Temperature(),      # Scale logits by temperature
                                 Softmax(),          # Convert logits to probabilities
                             ])
+        self.log_step_signals = getattr(config, 'log_step_signals', False)
         
+    def _sample_tokens(self, probs: torch.Tensor, top_k: int = 0, top_p: float = 1.0) -> torch.Tensor:
+        """Sample tokens using torch.multinomial (independent per row).
+        flashinfer's top_k_top_p_sampling_from_probs produces identical samples
+        for identical input rows (shared RNG), causing correlated generations
+        when multiple copies of the same prompt are in the batch."""
+        if top_k > 0:
+            topk_vals, _ = torch.topk(probs, top_k, dim=-1)
+            probs = probs.masked_fill(probs < topk_vals[:, -1:], 0.0)
+        if top_p < 1.0:
+            sorted_probs, sorted_indices = torch.sort(probs, dim=-1, descending=True)
+            cumsum = torch.cumsum(sorted_probs, dim=-1)
+            mask = (cumsum - sorted_probs) > top_p
+            sorted_probs[mask] = 0.0
+            probs = torch.zeros_like(probs).scatter_(1, sorted_indices, sorted_probs)
+        probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        return torch.multinomial(probs, num_samples=1).squeeze(-1).to(torch.int64)
+
     def apply_repetition_penalty(self, probs: torch.Tensor, seqs: list[Sequence]):
         # probs: (batch_size, block_len, vocab_size)
         for i, seq in enumerate(seqs):
@@ -290,11 +308,37 @@ class Scheduler:
                         k = torch.searchsorted(cumsum, torch.tensor(seq.eb_threshold, device=P.device), right=False).item()
                         if k == 0:
                             k = 1
-                        # print(k)
                         selected_token_indices = mask_index.nonzero(as_tuple=True)[0][order[:k]]
-                        # print(selected_token_indices)
                         transfer_index[selected_token_indices] = True
                         num_to_transfer = k
+
+                    elif seq.remasking_strategy == 'highest_confidence':
+                        confidence = torch.where(mask_index, seq_x0_p, -np.inf)
+                        _, top_indices = torch.topk(confidence, num_to_transfer)
+                        transfer_index[top_indices] = True
+
+                    elif seq.remasking_strategy == 'anti_sequential':
+                        if mask_index.any():
+                            last_mask_pos = mask_index.nonzero(as_tuple=True)[0].max().item()
+                            start_pos = max(last_mask_pos - num_to_transfer + 1, 0)
+                            transfer_index[start_pos:last_mask_pos + 1] = True
+
+                    elif seq.remasking_strategy == 'top2_margin':
+                        block_probs = probs[start_idx : start_idx + block_len]
+                        top2_vals, _ = block_probs.topk(2, dim=-1)  # (block_len, 2)
+                        margin = top2_vals[:, 0] - top2_vals[:, 1]
+                        margin = torch.where(mask_index, margin, torch.tensor(-torch.inf, device=margin.device))
+                        _, top_indices = torch.topk(margin, num_to_transfer)
+                        transfer_index[top_indices] = True
+
+                    elif seq.remasking_strategy == 'least_entropy':
+                        block_probs = probs[start_idx : start_idx + block_len]
+                        P = block_probs[mask_index]
+                        entropies = -(P.clamp_min(EPS) * (P.clamp_min(EPS)).log()).sum(dim=-1)
+                        _, order = torch.sort(entropies, dim=0, descending=False)
+                        k = min(num_to_transfer, len(order))
+                        selected = mask_index.nonzero(as_tuple=True)[0][order[:k]]
+                        transfer_index[selected] = True
 
                     # update - Tensors
                     seq.intermediate_block_tokens = torch.where(transfer_index, seq_x0, current_block_tensor)
@@ -421,18 +465,11 @@ class Scheduler:
             mask_token_mask = (batch_current_tokens == self.mask_token_id)
 
             # --- Softmax + Sampling (sparse: only masked positions) ---
-            # Check if logits are already sparse (computed only for masked positions)
-            sparse_logits_indices = chain_state.get('sparse_logits_indices', None) if chain_state is not None else None
             flat_mask = mask_token_mask.view(-1)
 
-            if sparse_logits_indices is not None:
-                # Logits are already sparse — no need to reshape to (batch, block_len, vocab)
-                vocab_size = logits.shape[-1]
-                d_logits = logits  # already (num_masked, vocab_size)
-            else:
-                d_logits_3d = logits.view(d_batch_size, block_len, -1)
-                d_logits = d_logits_3d.reshape(-1, d_logits_3d.shape[-1])
-                vocab_size = d_logits.shape[-1]
+            d_logits_3d = logits.view(d_batch_size, block_len, -1)
+            d_logits = d_logits_3d.reshape(-1, d_logits_3d.shape[-1])
+            vocab_size = d_logits.shape[-1]
 
             # Predict all_masked from CPU-side state to avoid GPU→CPU sync
             if chain_state is not None:
@@ -443,11 +480,7 @@ class Scheduler:
                 all_masked = all(seq.current_denoising_step == 0 for seq in _s)
 
             # Use dense path when all masked or too few masked positions for flashinfer kernel
-            # When logits are already sparse from model_runner, always use sparse path
-            # (small-batch safety handled inside sparse path with PyTorch softmax fallback)
-            if sparse_logits_indices is not None:
-                use_dense = False
-            elif all_masked:
+            if all_masked:
                 use_dense = True
             elif d_batch_size * block_len < 8:
                 use_dense = True  # total positions too few for flashinfer
@@ -469,24 +502,14 @@ class Scheduler:
                     probs = self.sample_pipe(d_logits, temperature=_s[0].temperature).view(d_batch_size, block_len, -1)
                 self.apply_repetition_penalty(probs, _s)
                 flat_probs = probs.view(-1, vocab_size)
-                if flat_probs.shape[0] < 8:
-                    flat_samples = torch.multinomial(flat_probs, num_samples=1).squeeze(-1).to(torch.int64)
-                else:
-                    flat_samples = top_k_top_p_sampling_from_probs(
-                        flat_probs, top_k=_s[0].top_k, top_p=_s[0].top_p
-                    ).to(torch.int64)
+                flat_samples = self._sample_tokens(flat_probs, _s[0].top_k, _s[0].top_p)
                 batch_seq_x0 = flat_samples.view(d_batch_size, block_len)
                 batch_seq_x0_p = torch.gather(flat_probs, 1, flat_samples.unsqueeze(-1)).view(d_batch_size, block_len)
                 batch_seq_x0_logp = torch.log(batch_seq_x0_p.clamp_min(EPS))
             else:
                 # Sparse path: only process masked positions
-                if sparse_logits_indices is not None:
-                    # Logits already sparse from model_runner — use directly
-                    masked_indices = sparse_logits_indices
-                    sparse_logits = d_logits  # already (num_masked, vocab_size)
-                else:
-                    masked_indices = flat_mask.nonzero(as_tuple=True)[0]
-                    sparse_logits = d_logits[masked_indices]
+                masked_indices = flat_mask.nonzero(as_tuple=True)[0]
+                sparse_logits = d_logits[masked_indices]
                 if sparse_logits.shape[0] < 8:
                     # PyTorch fallback: flashinfer OnlineSoftmax crashes for < 8 rows
                     sparse_probs = torch.softmax(sparse_logits.float() / _s[0].temperature, dim=-1).to(sparse_logits.dtype)
@@ -507,21 +530,15 @@ class Scheduler:
                             sparse_probs[row_indices[:, None], torch.tensor(seen_tokens, device=device)] /= seq.repetition_penalty
                             sparse_probs[row_indices] /= sparse_probs[row_indices].sum(dim=-1, keepdim=True)
 
-                if sparse_probs.shape[0] < 8:
-                    # PyTorch fallback for small batches (flashinfer sampling kernel minimum)
-                    sparse_samples = torch.multinomial(sparse_probs, num_samples=1).squeeze(-1).to(torch.int64)
-                else:
-                    sparse_samples = top_k_top_p_sampling_from_probs(
-                        sparse_probs, top_k=_s[0].top_k, top_p=_s[0].top_p
-                    ).to(torch.int64)
+                sparse_samples = self._sample_tokens(sparse_probs, _s[0].top_k, _s[0].top_p)
                 sparse_x0_p = torch.gather(sparse_probs, 1, sparse_samples.unsqueeze(-1)).squeeze(-1)
 
                 # Scatter back to full (batch_size, block_len) shape
                 batch_seq_x0 = batch_current_tokens.clone()
                 batch_seq_x0.view(-1)[masked_indices] = sparse_samples
-                batch_seq_x0_p = torch.zeros(d_batch_size, block_len, device=device)
+                batch_seq_x0_p = torch.zeros(d_batch_size, block_len, device=device, dtype=sparse_x0_p.dtype)
                 batch_seq_x0_p.view(-1)[masked_indices] = sparse_x0_p
-                batch_seq_x0_logp = torch.zeros(d_batch_size, block_len, device=device)
+                batch_seq_x0_logp = torch.zeros(d_batch_size, block_len, device=device, dtype=sparse_x0_p.dtype)
                 batch_seq_x0_logp.view(-1)[masked_indices] = torch.log(sparse_x0_p.clamp_min(EPS))
                 # Store sparse_probs for entropy computation later
                 _sparse_probs = sparse_probs
@@ -605,12 +622,63 @@ class Scheduler:
                 B, L = mask_token_mask.shape
                 scores = torch.rand((B, L), device=device)
                 scores = scores.masked_fill(~mask_token_mask, -1.0)
-                # Use block_len as k (small, avoids GPU→CPU sync)
                 _, top_indices = scores.topk(block_len, dim=-1)
                 k_mask = torch.arange(block_len, device=device).unsqueeze(0) < effective_num_to_transfer.unsqueeze(1)
                 transfer_index = torch.zeros_like(mask_token_mask, dtype=torch.bool)
                 transfer_index.scatter_(1, top_indices, k_mask)
                 transfer_index &= mask_token_mask
+
+            elif strategy == "highest_confidence":
+                # Opposite of low_confidence_static: commit MOST confident first
+                confidence = torch.where(
+                    mask_token_mask, batch_seq_x0_p, torch.full_like(batch_seq_x0_p, -torch.inf)
+                )
+                _, top_indices = torch.topk(confidence, k=block_len, dim=1)
+                k_mask = torch.arange(block_len, device=device).unsqueeze(0) < effective_num_to_transfer.unsqueeze(1)
+                transfer_index = torch.zeros_like(confidence, dtype=torch.bool)
+                transfer_index.scatter_(1, top_indices, k_mask)
+                transfer_index &= mask_token_mask
+
+            elif strategy == "anti_sequential":
+                # Right-to-left: unmask last masked position first
+                range_tensor = torch.arange(block_len, device=device).unsqueeze(0)
+                # Find last masked position (rightmost)
+                reversed_mask = mask_token_mask.flip(dims=[1])
+                last_mask_pos_rev = torch.where(
+                    mask_available,
+                    torch.argmax(reversed_mask.int(), dim=1),
+                    torch.full_like(effective_num_to_transfer, block_len),
+                )
+                last_mask_pos = block_len - 1 - last_mask_pos_rev
+                end = (last_mask_pos + 1).unsqueeze(1)
+                start = (end - effective_num_to_transfer.unsqueeze(1)).clamp_min(0)
+                seq_transfer_index = (range_tensor >= start) & (range_tensor < end)
+                transfer_index = seq_transfer_index & mask_token_mask
+
+            elif strategy == "top2_margin":
+                # Commit position with largest gap between top-1 and top-2 probabilities
+                if use_dense:
+                    top2_vals, _ = probs.topk(2, dim=-1)  # (batch, block_len, 2)
+                    margin = top2_vals[:, :, 0] - top2_vals[:, :, 1]  # (batch, block_len)
+                else:
+                    sparse_top2, _ = _sparse_probs.topk(2, dim=-1)  # (num_masked, 2)
+                    sparse_margin = sparse_top2[:, 0] - sparse_top2[:, 1]
+                    margin = torch.zeros(d_batch_size, block_len, device=device, dtype=sparse_margin.dtype)
+                    margin.view(-1)[_masked_indices] = sparse_margin
+                margin = torch.where(
+                    mask_token_mask, margin, torch.full_like(margin, -torch.inf)
+                )
+                _, top_indices = torch.topk(margin, k=block_len, dim=1)
+                k_mask = torch.arange(block_len, device=device).unsqueeze(0) < effective_num_to_transfer.unsqueeze(1)
+                transfer_index = torch.zeros_like(margin, dtype=torch.bool)
+                transfer_index.scatter_(1, top_indices, k_mask)
+                transfer_index &= mask_token_mask
+
+            elif strategy == "least_entropy":
+                # Commit position with lowest entropy first (most certain)
+                needs_entropy = True
+                pass  # handled below after entropy computation, similar to entropy_bounded
+
             else:
                 raise ValueError(f"Unsupported remasking strategy: {strategy}")
 
@@ -632,7 +700,7 @@ class Scheduler:
                 else:
                     sparse_log_p = _sparse_probs.clamp_min(EPS).log()
                     sparse_ent = -(_sparse_probs * sparse_log_p).sum(dim=-1)
-                    entropies_all = torch.zeros(d_batch_size, block_len, device=device)
+                    entropies_all = torch.zeros(d_batch_size, block_len, device=device, dtype=sparse_ent.dtype)
                     entropies_all.view(-1)[_masked_indices] = sparse_ent
 
                 # Now do entropy_bounded strategy
@@ -653,6 +721,29 @@ class Scheduler:
                 transfer_index.scatter_(1, order[:, :block_len], k_mask)
                 transfer_index &= mask_token_mask
                 final_transfer_index = transfer_index & mask_token_mask
+
+            elif needs_entropy and strategy == "least_entropy":
+                # least_entropy needs entropy to select lowest-entropy (most certain) position
+                if use_dense:
+                    log_probs_full = probs.clamp_min(EPS).log()
+                    entropies_all = -(probs * log_probs_full).sum(dim=-1)
+                else:
+                    sparse_log_p = _sparse_probs.clamp_min(EPS).log()
+                    sparse_ent = -(_sparse_probs * sparse_log_p).sum(dim=-1)
+                    entropies_all = torch.zeros(d_batch_size, block_len, device=device, dtype=sparse_ent.dtype)
+                    entropies_all.view(-1)[_masked_indices] = sparse_ent
+
+                # Select positions with lowest entropy among masked positions
+                masked_entropies = torch.where(
+                    mask_token_mask, entropies_all, torch.full_like(entropies_all, torch.inf)
+                )
+                _, top_indices = torch.topk(masked_entropies, k=block_len, dim=1, largest=False)
+                k_mask = torch.arange(block_len, device=device).unsqueeze(0) < effective_num_to_transfer.unsqueeze(1)
+                transfer_index = torch.zeros_like(mask_token_mask, dtype=torch.bool)
+                transfer_index.scatter_(1, top_indices, k_mask)
+                transfer_index &= mask_token_mask
+                final_transfer_index = transfer_index & mask_token_mask
+
             elif can_skip_entropy:
                 # Lazy entropy: skip computation in chain intermediate steps
                 entropies_all = batch_entropies  # reuse previous (zeros propagate)
@@ -664,8 +755,24 @@ class Scheduler:
                 else:
                     sparse_log_p = _sparse_probs.clamp_min(EPS).log()
                     sparse_ent = -(_sparse_probs * sparse_log_p).sum(dim=-1)
-                    entropies_all = torch.zeros(d_batch_size, block_len, device=device)
+                    entropies_all = torch.zeros(d_batch_size, block_len, device=device, dtype=sparse_ent.dtype)
                     entropies_all.view(-1)[_masked_indices] = sparse_ent
+
+            # --- Signal logging: record per-step commit signals (only when enabled) ---
+            if self.log_step_signals:
+                committed_positions = final_transfer_index.cpu().tolist()
+                confidence_vals = batch_seq_x0_p.cpu().tolist()
+                step_idx = chain_state['cpu_step'] if chain_state is not None and 'cpu_step' in chain_state else None
+                for j, seq in enumerate(denoising_seqs):
+                    committed = [pos for pos, c in enumerate(committed_positions[j]) if c]
+                    if committed:
+                        sig = {
+                            'step': step_idx if step_idx is not None else seq.current_denoising_step,
+                            'strategy': strategy,
+                            'committed_positions': committed,
+                            'confidence': [confidence_vals[j][p] for p in committed],
+                        }
+                        seq.block_step_signals.append(sig)
 
             batch_new_tokens = torch.where(final_transfer_index, batch_seq_x0, batch_current_tokens)
             batch_new_trajectory = torch.where(
