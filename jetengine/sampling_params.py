@@ -11,6 +11,10 @@ class SamplingParams:
     block_length: int = 4
     denoising_steps: int = 4
     dynamic_threshold: float = 0.75  # opt28: 0.9→0.75, best for dynamic_pmax (+1.6% pass@1 full MATH-500)
+    # Position-temperature: scale T per block position. slope > 0 → rightmost
+    # positions warmer (more diverse, fewer multi-commits there). slope < 0 →
+    # rightmost cooler (greedier). T_i = T * (1 + slope * i / (L-1)).
+    pos_temp_slope: float = 0.0  # 0 = flat (current behavior)
     eb_threshold: float = 0.35
     topk: int = 0
     topp: float = 1

@@ -92,6 +92,7 @@ class Sequence:
         self.cw_tau = getattr(sampling_params, 'cw_tau', -2.3)
         self.lsz_threshold = getattr(sampling_params, 'lsz_threshold', 4.5)
         self.rel_top_alpha = getattr(sampling_params, 'rel_top_alpha', 0.85)
+        self.pos_temp_slope = getattr(sampling_params, 'pos_temp_slope', 0.0)
         self.mask_token_id = mask_token_id
         self.num_transfer_tokens_per_step = self._get_num_transfer_tokens()
         

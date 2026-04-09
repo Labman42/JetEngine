@@ -567,11 +567,26 @@ class Scheduler:
                     predicted_masked = d_batch_size * max(1, min_remaining)
                 use_dense = predicted_masked < 8
 
+            # Pre-compute per-position temperature vector when pos_temp_slope != 0.
+            # T_i = T_base * (1 + slope * i / (L-1)). slope > 0 → warmer rightmost.
+            _pts = getattr(_s[0], 'pos_temp_slope', 0.0)
+            _use_pos_temp = (_pts != 0.0 and block_len > 1)
+            if _use_pos_temp:
+                _T_base = _s[0].temperature
+                _pos_frac = torch.arange(block_len, device=device, dtype=torch.float32) / (block_len - 1)
+                _T_vec = _T_base * (1.0 + _pts * _pos_frac)  # (block_len,)
+                _T_vec = _T_vec.clamp_min(0.01)  # safety
+
             if _pos_fp_done:
                 pass  # fast path already populated batch_seq_x0*, skip dense/sparse
             elif use_dense:
-                # Dense path: all positions masked (first denoising step), no gather/scatter overhead
-                if d_logits.shape[0] < 8:
+                # Dense path: all positions masked (first denoising step)
+                if _use_pos_temp:
+                    # Per-position temperature: reshape → scale → softmax
+                    logits_3d = d_logits.view(d_batch_size, block_len, -1).float()
+                    scaled = logits_3d / _T_vec.view(1, block_len, 1)
+                    probs = torch.softmax(scaled, dim=-1).to(d_logits.dtype).view(d_batch_size, block_len, -1)
+                elif d_logits.shape[0] < 8:
                     probs = torch.softmax(d_logits.float() / _s[0].temperature, dim=-1).to(d_logits.dtype).view(d_batch_size, block_len, -1)
                 else:
                     probs = self.sample_pipe(d_logits, temperature=_s[0].temperature).view(d_batch_size, block_len, -1)
@@ -585,8 +600,12 @@ class Scheduler:
                 # Sparse path: only process masked positions
                 masked_indices = flat_mask.nonzero(as_tuple=True)[0]
                 sparse_logits = d_logits[masked_indices]
-                if sparse_logits.shape[0] < 8:
-                    # PyTorch fallback: flashinfer OnlineSoftmax crashes for < 8 rows
+                if _use_pos_temp:
+                    # Map each sparse row to its block position and apply position T
+                    pos_idx = (masked_indices % block_len).long()
+                    T_per_row = _T_vec[pos_idx].unsqueeze(1)  # (num_masked, 1)
+                    sparse_probs = torch.softmax(sparse_logits.float() / T_per_row, dim=-1).to(sparse_logits.dtype)
+                elif sparse_logits.shape[0] < 8:
                     sparse_probs = torch.softmax(sparse_logits.float() / _s[0].temperature, dim=-1).to(sparse_logits.dtype)
                 else:
                     sparse_probs = self.sample_pipe(sparse_logits, temperature=_s[0].temperature)
