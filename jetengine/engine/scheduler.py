@@ -839,6 +839,81 @@ class Scheduler:
                         no_commit.unsqueeze(1), fallback, transfer_index
                     )
 
+            elif strategy == "consensus_commit":
+                # K-sample majority-vote multi-commit. For each masked position,
+                # draw K=4 independent multinomial samples from the softmax and
+                # commit IF ≥3 samples agree on the same token (committed value).
+                # Rationale: this is a Monte-Carlo proxy for joint marginalization —
+                # positions where multiple samples converge are "self-determined"
+                # (the distribution is sharply peaked around the modal token), so
+                # committing is safe even when committing multiple positions in
+                # parallel. Positions with diffuse distributions will have low
+                # consensus and fall back to leftmost.
+                K = 4
+                if use_dense:
+                    fp = flat_probs  # (bs*L, vocab)
+                    rows_all = fp.shape[0]
+                else:
+                    fp = _sparse_probs  # (num_masked, vocab)
+                    rows_all = fp.shape[0]
+
+                if rows_all == 0:
+                    # Nothing masked (shouldn't happen but be safe)
+                    consensus_tokens_full = batch_current_tokens.clone()
+                    has_majority_full = torch.zeros_like(mask_token_mask, dtype=torch.bool)
+                else:
+                    # K samples, shape (K, N)
+                    samples_k = torch.stack(
+                        [torch.multinomial(fp, 1).squeeze(-1) for _ in range(K)], dim=0
+                    )
+                    # Sort-based mode check for K=4:
+                    # majority exists iff sorted[0..2] all equal OR sorted[1..3] all equal.
+                    sorted_k = torch.sort(samples_k, dim=0).values  # (K, N)
+                    case_A = (sorted_k[0] == sorted_k[1]) & (sorted_k[1] == sorted_k[2])
+                    case_B = (sorted_k[1] == sorted_k[2]) & (sorted_k[2] == sorted_k[3])
+                    has_majority = case_A | case_B
+                    mode_val = torch.where(case_A, sorted_k[0], sorted_k[1])  # (N,)
+
+                    if use_dense:
+                        has_majority_full = has_majority.view(d_batch_size, block_len)
+                        consensus_tokens_full = batch_current_tokens.clone()
+                        consensus_tokens_full.view(-1)[has_majority.nonzero(as_tuple=True)[0]] = (
+                            mode_val[has_majority]
+                        )
+                    else:
+                        has_majority_full = torch.zeros(d_batch_size, block_len, device=device, dtype=torch.bool)
+                        consensus_tokens_full = batch_current_tokens.clone()
+                        masked_lin_idx = _masked_indices
+                        majority_idx_within = has_majority.nonzero(as_tuple=True)[0]
+                        majority_lin_idx = masked_lin_idx[majority_idx_within]
+                        has_majority_full.view(-1)[majority_lin_idx] = True
+                        consensus_tokens_full.view(-1)[majority_lin_idx] = mode_val[majority_idx_within]
+
+                # EOS safety: never commit a stop token via consensus
+                stop_ids = torch.tensor(list(_s[0].stop_words or []),
+                                        device=device, dtype=consensus_tokens_full.dtype)
+                if stop_ids.numel() > 0:
+                    is_stop = (consensus_tokens_full.unsqueeze(-1) == stop_ids).any(dim=-1)
+                    has_majority_full = has_majority_full & (~is_stop)
+
+                _qualifies_mask = has_majority_full & mask_token_mask
+                # Override committed tokens with the consensus (not the first sample)
+                batch_seq_x0 = torch.where(_qualifies_mask, consensus_tokens_full, batch_seq_x0)
+                # Fallback: leftmost if nothing consensus-qualified
+                num_transferred = _qualifies_mask.sum(dim=1)
+                needs_fallback = (num_transferred < 1) & mask_available
+                if needs_fallback.any():
+                    first_mp = torch.argmax(mask_token_mask.int(), dim=1)
+                    rows = torch.arange(d_batch_size, device=device)
+                    fallback = torch.zeros_like(_qualifies_mask)
+                    fallback[rows, first_mp] = True
+                    fallback &= mask_token_mask
+                    transfer_index = torch.where(
+                        needs_fallback.unsqueeze(1), fallback, _qualifies_mask
+                    )
+                else:
+                    transfer_index = _qualifies_mask
+
             elif strategy == "dynamic_pmax":
                 # Like low_confidence_dynamic but thresholds on P(argmax) per
                 # position instead of P(sampled-token). At T=1.0 multinomial

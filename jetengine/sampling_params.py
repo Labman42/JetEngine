@@ -10,7 +10,7 @@ class SamplingParams:
     # Block Diffusion Parameters
     block_length: int = 4
     denoising_steps: int = 4
-    dynamic_threshold: float = 0.8  # opt27: 0.9→0.8, +0.9% pass@1 on MATH-500 gen4
+    dynamic_threshold: float = 0.75  # opt28: 0.9→0.75, best for dynamic_pmax (+1.6% pass@1 full MATH-500)
     eb_threshold: float = 0.35
     topk: int = 0
     topp: float = 1
@@ -33,6 +33,6 @@ class SamplingParams:
         'highest_confidence', 'anti_sequential', 'top2_margin', 'least_entropy',
         # Joint-distribution aware multi-commit strategies (opt27)
         'causal_waterfall', 'logit_salience', 'relative_top', 'dynamic_contiguous',
-        'confidence_chain', 'dynamic_pmax',
+        'confidence_chain', 'dynamic_pmax', 'consensus_commit',
     ] = 'low_confidence_static'
     stop_words: list[int] | None = None
