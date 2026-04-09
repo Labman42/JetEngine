@@ -479,8 +479,81 @@ class Scheduler:
                 # First step: all positions start masked
                 all_masked = all(seq.current_denoising_step == 0 for seq in _s)
 
+            # Fast path for position-based strategies (sequential / anti_sequential):
+            # they commit a deterministic position per step (leftmost/rightmost mask) and
+            # do not use confidence at other positions. We can sample only the target row
+            # per sequence — bs rows instead of bs*block_len.
+            _strategy_early = _s[0].remasking_strategy
+            _schedule_all_ones = all(n == 1 for n in _s[0].num_transfer_tokens_per_step)
+            _use_pos_fast_path = (
+                _strategy_early in ("sequential", "anti_sequential")
+                and _schedule_all_ones
+                and d_batch_size >= 8  # torch.multinomial path needs ≥8 rows for parity
+                and not any(seq.repetition_penalty != 1.0 and seq.num_tokens > seq.max_tokens // 2 for seq in _s)
+            )
+
+            if _use_pos_fast_path:
+                _row_arange = torch.arange(d_batch_size, device=device)
+                mask_available_fp = mask_token_mask.any(dim=1)
+                if _strategy_early == "sequential":
+                    target_positions = torch.where(
+                        mask_available_fp,
+                        torch.argmax(mask_token_mask.int(), dim=1),
+                        torch.zeros(d_batch_size, device=device, dtype=torch.long),
+                    )
+                else:  # anti_sequential
+                    reversed_mask = mask_token_mask.flip(dims=[1])
+                    last_mask_pos_rev = torch.where(
+                        mask_available_fp,
+                        torch.argmax(reversed_mask.int(), dim=1),
+                        torch.zeros(d_batch_size, device=device, dtype=torch.long),
+                    )
+                    target_positions = (block_len - 1 - last_mask_pos_rev).clamp_min(0)
+
+                target_linear_idx = _row_arange * block_len + target_positions  # (bs,)
+                target_logits = d_logits[target_linear_idx]  # (bs, vocab)
+
+                if target_logits.shape[0] < 8:
+                    target_probs = torch.softmax(
+                        target_logits.float() / _s[0].temperature, dim=-1
+                    ).to(target_logits.dtype)
+                else:
+                    target_probs = self.sample_pipe(target_logits, temperature=_s[0].temperature)
+
+                target_samples = self._sample_tokens(target_probs, _s[0].top_k, _s[0].top_p)
+                target_probs_at_sample = torch.gather(
+                    target_probs, 1, target_samples.unsqueeze(-1)
+                ).squeeze(-1)
+
+                # Build full-shape tensors; only target positions are populated.
+                batch_seq_x0 = batch_current_tokens.clone()
+                batch_seq_x0[_row_arange, target_positions] = target_samples
+                batch_seq_x0_p = torch.zeros(d_batch_size, block_len, device=device,
+                                             dtype=target_probs_at_sample.dtype)
+                batch_seq_x0_p[_row_arange, target_positions] = target_probs_at_sample
+                batch_seq_x0_logp = torch.zeros_like(batch_seq_x0_p)
+                batch_seq_x0_logp[_row_arange, target_positions] = torch.log(
+                    target_probs_at_sample.clamp_min(EPS)
+                )
+                # Entropy at target only (cheap, bs rows)
+                _target_log_p = target_probs.clamp_min(EPS).log()
+                _target_entropy = -(target_probs * _target_log_p).sum(dim=-1)
+                _pos_fp_entropies = torch.zeros(d_batch_size, block_len, device=device,
+                                                dtype=target_probs_at_sample.dtype)
+                _pos_fp_entropies[_row_arange, target_positions] = _target_entropy.to(
+                    target_probs_at_sample.dtype
+                )
+                _sparse_probs = None
+                _masked_indices = None
+                use_dense = False  # skip dense/sparse branches
+                _pos_fp_done = True
+            else:
+                _pos_fp_done = False
+
             # Use dense path when all masked or too few masked positions for flashinfer kernel
-            if all_masked:
+            if _pos_fp_done:
+                pass  # already sampled via fast path
+            elif all_masked:
                 use_dense = True
             elif d_batch_size * block_len < 8:
                 use_dense = True  # total positions too few for flashinfer
@@ -494,7 +567,9 @@ class Scheduler:
                     predicted_masked = d_batch_size * max(1, min_remaining)
                 use_dense = predicted_masked < 8
 
-            if use_dense:
+            if _pos_fp_done:
+                pass  # fast path already populated batch_seq_x0*, skip dense/sparse
+            elif use_dense:
                 # Dense path: all positions masked (first denoising step), no gather/scatter overhead
                 if d_logits.shape[0] < 8:
                     probs = torch.softmax(d_logits.float() / _s[0].temperature, dim=-1).to(d_logits.dtype).view(d_batch_size, block_len, -1)
@@ -744,6 +819,9 @@ class Scheduler:
                 transfer_index &= mask_token_mask
                 final_transfer_index = transfer_index & mask_token_mask
 
+            elif _pos_fp_done:
+                # Position fast-path: entropy was computed only at the target position
+                entropies_all = _pos_fp_entropies
             elif can_skip_entropy:
                 # Lazy entropy: skip computation in chain intermediate steps
                 entropies_all = batch_entropies  # reuse previous (zeros propagate)

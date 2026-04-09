@@ -275,7 +275,7 @@ class ModelRunner:
         max_len = max(len(seq.block_table) for seq in seqs)
         if max_len == 0:
             return None
-        block_tables = [seq.block_table + [-1] *
+        block_tables = [seq.block_table + [0] *
                         (max_len - len(seq.block_table)) for seq in seqs]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
@@ -540,7 +540,6 @@ class ModelRunner:
         positions: torch.Tensor,
         num_need_logits: int = None,
         reuse_context: bool = False,
-        masked_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, bool]:
         if (
             self.enforce_eager
@@ -580,12 +579,25 @@ class ModelRunner:
             graph_context_lens.copy_(context.context_lens)
 
             graph_block_tables = graph_vars["block_tables"][:batch_size]
-            graph_block_tables.fill_(-1)
+            graph_block_tables.fill_(0)
             if context.block_tables is not None:
                 required_blocks = context.block_tables.shape[1]
                 if required_blocks > graph_block_tables.shape[1]:
                     return None, False
                 graph_block_tables[:, :required_blocks].copy_(context.block_tables)
+                # Validate block table entries (debug: catch illegal memory access root cause)
+                if not hasattr(self, '_bt_check_counter'):
+                    self._bt_check_counter = 0
+                self._bt_check_counter += 1
+                if self._bt_check_counter % 50 == 0:  # check every 50 steps
+                    max_block_id = context.block_tables.max().item()
+                    if max_block_id >= self.config.num_kvcache_blocks:
+                        print(f"[BUG] block_table block_id={max_block_id} >= num_blocks={self.config.num_kvcache_blocks}")
+                        return None, False
+                    max_ctx_len = context.context_lens.max().item()
+                    if max_ctx_len > self.config.max_model_len:
+                        print(f"[BUG] context_lens={max_ctx_len} > max_model_len={self.config.max_model_len}")
+                        return None, False
 
             # Plan flashinfer with updated metadata before graph replay
             fi_wrapper = None
@@ -616,15 +628,11 @@ class ModelRunner:
         if num_need_logits is not None and num_need_logits < batch_size:
             logits_len = num_need_logits * block_len
             hidden = hidden[:logits_len]
-        # Sparse logits: only compute LM head for masked positions
-        if masked_indices is not None:
-            hidden = hidden[masked_indices]
         logits = self.model.compute_logits(hidden)
         return logits, True
 
     def run(self, seqs: list[Sequence], run_type: RunType, num_need_logits: int = None,
-            reuse_context: bool = False, chain_batch_tokens: torch.Tensor | None = None,
-            masked_indices: torch.Tensor | None = None) -> torch.Tensor:
+            reuse_context: bool = False, chain_batch_tokens: torch.Tensor | None = None) -> torch.Tensor:
         if run_type == RunType.PREFILL:
             input_ids, positions = self.prepare_prefill(seqs)
         elif run_type == RunType.DENOISE:
@@ -640,7 +648,7 @@ class ModelRunner:
         if run_type == RunType.DENOISE and not self.enforce_eager:
             logits, used_graph = self._run_denoise_with_cudagraph(
                 seqs, input_ids, positions, num_need_logits=num_need_logits,
-                reuse_context=reuse_context, masked_indices=masked_indices,
+                reuse_context=reuse_context,
             )
             if not used_graph:
                 if need_selective:
@@ -654,7 +662,9 @@ class ModelRunner:
         else:
             logits = self.run_model(input_ids, positions)
         reset_context()
-        return logits if self.rank == 0 else None
+        # All TP ranks now receive the full logits via all_gather in ParallelLMHead,
+        # so the scheduler/postprocess on each DP shard sees valid logits.
+        return logits
 
     @torch.inference_mode()
     def capture_cudagraph(self):

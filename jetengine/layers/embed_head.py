@@ -69,7 +69,10 @@ class ParallelLMHead(VocabParallelEmbedding):
             x = x[last_indices].contiguous()
         logits = F.linear(x, self.weight, self.bias)
         if self.tp_size > 1:
-            all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
-            dist.gather(logits, all_logits, 0, group=self.process_group)
-            logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
+            # all_gather so every TP rank has the full logits tensor — the scheduler /
+            # postprocess runs on all ranks (each sees its own DP shard's sequences) and
+            # needs logits for sampling. Using gather would leave non-root ranks with None.
+            all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)]
+            dist.all_gather(all_logits, logits, group=self.process_group)
+            logits = torch.cat(all_logits, -1)
         return logits
