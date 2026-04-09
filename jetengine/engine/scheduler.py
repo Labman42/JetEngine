@@ -754,6 +754,291 @@ class Scheduler:
                 needs_entropy = True
                 pass  # handled below after entropy computation, similar to entropy_bounded
 
+            elif strategy == "causal_waterfall":
+                # Commit a contiguous leftmost prefix of MASKED positions whose
+                # per-position P(argmax) each exceeds cw_tau (NOT cumulative).
+                # Only ever commits tokens the model is *independently* confident
+                # about, avoiding the "commit from broad marginals" pathology.
+                # At T=1.0 this usually fires only on syntactically-forced tokens
+                # (delimiters, digits after "="), matching the joint factorization
+                # where those positions are near-independent of others in the block.
+                if use_dense:
+                    max_probs = probs.max(dim=-1).values
+                    argmax_tokens = probs.argmax(dim=-1)
+                else:
+                    sparse_top = _sparse_probs.max(dim=-1)
+                    max_probs = torch.zeros(d_batch_size, block_len, device=device,
+                                            dtype=_sparse_probs.dtype)
+                    argmax_tokens = torch.full((d_batch_size, block_len), -1,
+                                               device=device, dtype=torch.long)
+                    max_probs.view(-1)[_masked_indices] = sparse_top.values
+                    argmax_tokens.view(-1)[_masked_indices] = sparse_top.indices
+
+                # EOS safety: suppress commitments whose argmax is a stop token.
+                # The eval uses stop_words = {151645, 151643, 151670} for SDAR.
+                stop_ids = torch.tensor(list(_s[0].stop_words or []),
+                                        device=device, dtype=argmax_tokens.dtype)
+                if stop_ids.numel() > 0:
+                    is_stop = (argmax_tokens.unsqueeze(-1) == stop_ids).any(dim=-1)
+                else:
+                    is_stop = torch.zeros_like(mask_token_mask)
+
+                # Per-position confident gate (NOT cumulative — that was the bug).
+                # cw_tau default −0.35 ⇒ require p_max > 0.70 per committed position.
+                floor = float(torch.tensor(_s[0].cw_tau, device=device).exp().item())
+                confident = (max_probs > floor) & mask_token_mask & (~is_stop)
+
+                # Contiguous leftmost prefix only
+                prefix = (torch.cumprod(confident.int(), dim=1) > 0)
+                transfer_index = prefix & mask_token_mask
+
+                # Always make progress: commit leftmost mask if nothing qualifies
+                no_commit = (~transfer_index.any(dim=1)) & mask_available
+                if no_commit.any():
+                    first_mp = torch.argmax(mask_token_mask.int(), dim=1)
+                    rows = torch.arange(d_batch_size, device=device)
+                    fallback = torch.zeros_like(transfer_index)
+                    fallback[rows, first_mp] = True
+                    fallback &= mask_token_mask
+                    transfer_index = torch.where(
+                        no_commit.unsqueeze(1), fallback, transfer_index
+                    )
+
+            elif strategy == "logit_salience":
+                # Commit only the leftmost masked position whose top logit is an
+                # extreme outlier (z > lsz_threshold, default 10). Adds a second
+                # position iff it ALSO passes the outlier bar AND is adjacent.
+                # Scale-invariant; fires only for "crystallized" tokens at T=1.0.
+                mu = d_logits.mean(dim=-1)
+                sigma = d_logits.std(dim=-1).clamp_min(1e-6)
+                max_logits = d_logits.max(dim=-1).values
+                argmax_tokens_flat = d_logits.argmax(dim=-1)
+                z_all = ((max_logits - mu) / sigma).view(d_batch_size, block_len)
+                argmax_tokens = argmax_tokens_flat.view(d_batch_size, block_len)
+
+                # EOS safety
+                stop_ids = torch.tensor(list(_s[0].stop_words or []),
+                                        device=device, dtype=argmax_tokens.dtype)
+                if stop_ids.numel() > 0:
+                    is_stop = (argmax_tokens.unsqueeze(-1) == stop_ids).any(dim=-1)
+                else:
+                    is_stop = torch.zeros_like(mask_token_mask)
+
+                salient = (z_all > _s[0].lsz_threshold) & mask_token_mask & (~is_stop)
+                prefix = (torch.cumprod(salient.int(), dim=1) > 0)
+                transfer_index = prefix & mask_token_mask
+
+                no_commit = (~transfer_index.any(dim=1)) & mask_available
+                if no_commit.any():
+                    first_mp = torch.argmax(mask_token_mask.int(), dim=1)
+                    rows = torch.arange(d_batch_size, device=device)
+                    fallback = torch.zeros_like(transfer_index)
+                    fallback[rows, first_mp] = True
+                    fallback &= mask_token_mask
+                    transfer_index = torch.where(
+                        no_commit.unsqueeze(1), fallback, transfer_index
+                    )
+
+            elif strategy == "dynamic_pmax":
+                # Like low_confidence_dynamic but thresholds on P(argmax) per
+                # position instead of P(sampled-token). At T=1.0 multinomial
+                # sampling often picks non-argmax tokens — their probabilities
+                # can be much lower than the position's true peakedness, so
+                # vanilla dynamic under-fires. Using P(argmax) correctly
+                # measures position confidence regardless of sample noise, so
+                # multi-token commit triggers more often on genuinely peaked
+                # positions — which is exactly the "independence-safe"
+                # condition for joint factorization.
+                if use_dense:
+                    max_probs = probs.max(dim=-1).values
+                    argmax_tokens = probs.argmax(dim=-1)
+                else:
+                    sparse_top = _sparse_probs.max(dim=-1)
+                    max_probs = torch.zeros(d_batch_size, block_len, device=device,
+                                            dtype=_sparse_probs.dtype)
+                    argmax_tokens = torch.full((d_batch_size, block_len), -1,
+                                               device=device, dtype=torch.long)
+                    max_probs.view(-1)[_masked_indices] = sparse_top.values
+                    argmax_tokens.view(-1)[_masked_indices] = sparse_top.indices
+
+                # Replace the committed position's token with the argmax
+                # (not the multinomial sample). This ensures we commit the
+                # high-confidence token the threshold was measuring.
+                _qualifies_mask = (max_probs > _s[0].dynamic_threshold) & mask_token_mask
+
+                # EOS safety gate (same as other novel strategies): never
+                # commit a stop token from this strategy.
+                stop_ids = torch.tensor(list(_s[0].stop_words or []),
+                                        device=device, dtype=argmax_tokens.dtype)
+                if stop_ids.numel() > 0:
+                    is_stop = (argmax_tokens.unsqueeze(-1) == stop_ids).any(dim=-1)
+                    _qualifies_mask = _qualifies_mask & (~is_stop)
+
+                # Override the sampled tokens with argmax at committed positions
+                batch_seq_x0 = torch.where(_qualifies_mask, argmax_tokens, batch_seq_x0)
+                # Also update the per-token probability to P(argmax) for the
+                # committed positions (so logprob tracking reflects what we committed).
+                batch_seq_x0_p = torch.where(_qualifies_mask, max_probs, batch_seq_x0_p)
+                batch_seq_x0_logp = torch.where(
+                    _qualifies_mask, max_probs.clamp_min(EPS).log(), batch_seq_x0_logp
+                )
+
+                # Dynamic-like: commit all qualifying (may be non-contiguous)
+                num_transferred = _qualifies_mask.sum(dim=1)
+                needs_fallback = (num_transferred < 1) & mask_available
+                if needs_fallback.any():
+                    first_mp = torch.argmax(mask_token_mask.int(), dim=1)
+                    rows = torch.arange(d_batch_size, device=device)
+                    fallback = torch.zeros_like(_qualifies_mask)
+                    fallback[rows, first_mp] = True
+                    fallback &= mask_token_mask
+                    transfer_index = torch.where(
+                        needs_fallback.unsqueeze(1), fallback, _qualifies_mask
+                    )
+                else:
+                    transfer_index = _qualifies_mask
+
+            elif strategy == "confidence_chain":
+                # Chain-aware multi-commit: the leftmost position has the most
+                # context (the committed prefix) and is easiest to determine, so
+                # accept it at a LOWER confidence bar. Rightmost positions are
+                # most exposed to uncommitted neighbors so require HIGHER
+                # confidence. Implements a position-dependent threshold
+                # schedule: thr(i) = base + slope * i.
+                # Defaults: base=0.55 at i=0, thr=0.80 at i=3 (slope=0.083/pos)
+                if use_dense:
+                    max_probs = probs.max(dim=-1).values
+                    argmax_tokens = probs.argmax(dim=-1)
+                else:
+                    sparse_top = _sparse_probs.max(dim=-1)
+                    max_probs = torch.zeros(d_batch_size, block_len, device=device,
+                                            dtype=_sparse_probs.dtype)
+                    argmax_tokens = torch.full((d_batch_size, block_len), -1,
+                                               device=device, dtype=torch.long)
+                    max_probs.view(-1)[_masked_indices] = sparse_top.values
+                    argmax_tokens.view(-1)[_masked_indices] = sparse_top.indices
+
+                stop_ids = torch.tensor(list(_s[0].stop_words or []),
+                                        device=device, dtype=argmax_tokens.dtype)
+                if stop_ids.numel() > 0:
+                    is_stop = (argmax_tokens.unsqueeze(-1) == stop_ids).any(dim=-1)
+                else:
+                    is_stop = torch.zeros_like(mask_token_mask)
+
+                # Per-position threshold schedule (increasing left→right)
+                base = 0.55
+                slope = (0.85 - base) / max(1, block_len - 1)
+                thr = torch.arange(block_len, device=device, dtype=max_probs.dtype) * slope + base
+                qualifies = (
+                    (max_probs > thr.unsqueeze(0))
+                    & mask_token_mask
+                    & (~is_stop)
+                )
+                # Contiguous leftmost prefix: if pos k fails, pos k+1 and beyond fail too
+                prefix = (torch.cumprod(qualifies.int(), dim=1) > 0)
+                transfer_index = prefix & mask_token_mask
+
+                no_commit = (~transfer_index.any(dim=1)) & mask_available
+                if no_commit.any():
+                    first_mp = torch.argmax(mask_token_mask.int(), dim=1)
+                    rows = torch.arange(d_batch_size, device=device)
+                    fallback = torch.zeros_like(transfer_index)
+                    fallback[rows, first_mp] = True
+                    fallback &= mask_token_mask
+                    transfer_index = torch.where(
+                        no_commit.unsqueeze(1), fallback, transfer_index
+                    )
+
+            elif strategy == "dynamic_contiguous":
+                # Same 0.9 threshold as low_confidence_dynamic but commits only a
+                # contiguous LEFTMOST prefix of qualifying positions. Strict
+                # left-bias preserves causality: position k commits only if 0..k-1
+                # also pass or are already committed. Guards against "island of
+                # confidence" where pos 3 passes but pos 1 is a guess.
+                if use_dense:
+                    max_probs = probs.max(dim=-1).values
+                    argmax_tokens = probs.argmax(dim=-1)
+                else:
+                    sparse_top = _sparse_probs.max(dim=-1)
+                    max_probs = torch.zeros(d_batch_size, block_len, device=device,
+                                            dtype=_sparse_probs.dtype)
+                    argmax_tokens = torch.full((d_batch_size, block_len), -1,
+                                               device=device, dtype=torch.long)
+                    max_probs.view(-1)[_masked_indices] = sparse_top.values
+                    argmax_tokens.view(-1)[_masked_indices] = sparse_top.indices
+
+                stop_ids = torch.tensor(list(_s[0].stop_words or []),
+                                        device=device, dtype=argmax_tokens.dtype)
+                if stop_ids.numel() > 0:
+                    is_stop = (argmax_tokens.unsqueeze(-1) == stop_ids).any(dim=-1)
+                else:
+                    is_stop = torch.zeros_like(mask_token_mask)
+
+                qualifies = (
+                    (max_probs > _s[0].dynamic_threshold)
+                    & mask_token_mask
+                    & (~is_stop)
+                )
+                prefix = (torch.cumprod(qualifies.int(), dim=1) > 0)
+                transfer_index = prefix & mask_token_mask
+                no_commit = (~transfer_index.any(dim=1)) & mask_available
+                if no_commit.any():
+                    first_mp = torch.argmax(mask_token_mask.int(), dim=1)
+                    rows = torch.arange(d_batch_size, device=device)
+                    fallback = torch.zeros_like(transfer_index)
+                    fallback[rows, first_mp] = True
+                    fallback &= mask_token_mask
+                    transfer_index = torch.where(
+                        no_commit.unsqueeze(1), fallback, transfer_index
+                    )
+
+            elif strategy == "relative_top":
+                # Commit leftmost contiguous prefix of positions whose P(argmax)
+                # is at least rel_top_alpha × (sequence-wise max P(argmax)) AND
+                # above an absolute floor. Adaptive to distribution scale.
+                if use_dense:
+                    max_probs = probs.max(dim=-1).values
+                    argmax_tokens = probs.argmax(dim=-1)
+                else:
+                    sparse_top = _sparse_probs.max(dim=-1)
+                    max_probs = torch.zeros(d_batch_size, block_len, device=device,
+                                            dtype=_sparse_probs.dtype)
+                    argmax_tokens = torch.full((d_batch_size, block_len), -1,
+                                               device=device, dtype=torch.long)
+                    max_probs.view(-1)[_masked_indices] = sparse_top.values
+                    argmax_tokens.view(-1)[_masked_indices] = sparse_top.indices
+
+                stop_ids = torch.tensor(list(_s[0].stop_words or []),
+                                        device=device, dtype=argmax_tokens.dtype)
+                if stop_ids.numel() > 0:
+                    is_stop = (argmax_tokens.unsqueeze(-1) == stop_ids).any(dim=-1)
+                else:
+                    is_stop = torch.zeros_like(mask_token_mask)
+
+                masked_mp = torch.where(
+                    mask_token_mask, max_probs, torch.full_like(max_probs, -1.0)
+                )
+                seq_max = masked_mp.max(dim=1, keepdim=True).values.clamp_min(EPS)
+                # Require relative ratio AND absolute floor of 0.5
+                qualifies = (
+                    (max_probs >= _s[0].rel_top_alpha * seq_max)
+                    & (max_probs > 0.5)
+                    & mask_token_mask
+                    & (~is_stop)
+                )
+                prefix = (torch.cumprod(qualifies.int(), dim=1) > 0)
+                transfer_index = prefix & mask_token_mask
+                no_commit = (~transfer_index.any(dim=1)) & mask_available
+                if no_commit.any():
+                    first_mp = torch.argmax(mask_token_mask.int(), dim=1)
+                    rows = torch.arange(d_batch_size, device=device)
+                    fallback = torch.zeros_like(transfer_index)
+                    fallback[rows, first_mp] = True
+                    fallback &= mask_token_mask
+                    transfer_index = torch.where(
+                        no_commit.unsqueeze(1), fallback, transfer_index
+                    )
+
             else:
                 raise ValueError(f"Unsupported remasking strategy: {strategy}")
 

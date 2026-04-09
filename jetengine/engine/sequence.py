@@ -63,6 +63,12 @@ class Sequence:
         
         self.entropies: list[float] = []
         self.block_entropies = torch.zeros(self.block_length, dtype=torch.float)
+
+        # Signal logging for remasking research
+        # Each element is a dict with per-step signals for one denoising step
+        self.block_step_signals: list[dict] = []
+        # Accumulated signals across all committed blocks
+        self.all_step_signals: list[list[dict]] = []
         
         # initial status based on whether prefill is needed.
         if self.num_prefill_tokens > 0:
@@ -82,6 +88,10 @@ class Sequence:
         self.remasking_strategy = sampling_params.remasking_strategy
         self.dynamic_threshold = sampling_params.dynamic_threshold
         self.eb_threshold = sampling_params.eb_threshold
+        # Novel strategy hyperparams (opt27)
+        self.cw_tau = getattr(sampling_params, 'cw_tau', -2.3)
+        self.lsz_threshold = getattr(sampling_params, 'lsz_threshold', 4.5)
+        self.rel_top_alpha = getattr(sampling_params, 'rel_top_alpha', 0.85)
         self.mask_token_id = mask_token_id
         self.num_transfer_tokens_per_step = self._get_num_transfer_tokens()
         
@@ -116,6 +126,7 @@ class Sequence:
         self.block_trajectory = torch.zeros(self.block_length, dtype=torch.long, device=device)
         self.block_logprobs = torch.zeros(self.block_length, dtype=torch.float, device=device)
         self.block_entropies = torch.zeros(self.block_length, dtype=torch.float, device=device)
+        self.block_step_signals = []
         self.status = SequenceStatus.DENOISING
 
     def commit_block(self, block_tokens: torch.Tensor | list[int]):
@@ -190,6 +201,10 @@ class Sequence:
 
             # Resetting to None/Zero is handled in start_new_block or implicitly
 
+        # Save step signals for this block
+        if self.block_step_signals:
+            self.all_step_signals.append(self.block_step_signals)
+
         if self.num_tokens >= self.num_prompt_tokens + self.max_tokens:
              self.status = SequenceStatus.FINISHED
 
@@ -230,6 +245,10 @@ class Sequence:
             self.trajectory.extend(b_traj[start_idx:block_len])
             self.logprobs.extend(b_logprobs[start_idx:block_len])
             self.entropies.extend(b_entropies[start_idx:block_len])
+
+        # Save step signals for this block
+        if self.block_step_signals:
+            self.all_step_signals.append(self.block_step_signals)
 
         if self.num_tokens >= self.num_prompt_tokens + self.max_tokens:
             self.status = SequenceStatus.FINISHED
