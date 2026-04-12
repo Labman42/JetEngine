@@ -293,6 +293,10 @@ FA3 replaces flashinfer for denoise attention, combining KV cache write + paged 
 | `tests/bench_compile.py` | torch.compile A/B benchmark |
 | `tests/test_sparse_sampling.py` | Sparse sampling correctness + benchmark |
 
+## Active Research
+
+- **Remasking Strategy Exploration**: [`research/remasking_strategies.md`](research/remasking_strategies.md) — systematic study of commit-order policies, hybrid strategies, and portfolio approaches for block diffusion decoding. Phases: diagnostic (exhaustive 24 orders) → signal isolation → hybrid design → speed optimization → validation.
+
 ## Files Modified (from nanovllm baseline)
 
 - `jetengine/engine/scheduler.py` — postprocess_unify, chain_state, zero-sync path, try_allocate_chain_blocks

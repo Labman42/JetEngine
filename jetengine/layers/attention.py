@@ -115,7 +115,8 @@ class BlockAttention(Attention):
             o = fa3_flash_attn_with_kvcache(q, k_cache, v_cache, k=k, v=v,
                                             cache_seqlens=context.context_lens,
                                             page_table=context.block_tables,
-                                            causal=False)
+                                            causal=False,
+                                            num_splits=1)
         elif context.fi_wrapper is not None:
             # flashinfer path: write KV to cache, then attend
             store_kvcache(k, v, k_cache, v_cache, context.fi_slot_mapping)

@@ -72,7 +72,7 @@ class BlockManager:
         
         if block_id in self.free_block_ids:
             self.free_block_ids.remove(block_id)
-            
+
         self.used_block_ids.add(block_id)
         return self.blocks[block_id]
 
@@ -89,6 +89,7 @@ class BlockManager:
         assert not seq.block_table
         h = -1
         cache_miss = False
+        disable_prefix_cache = True  # prefix caching disabled until stale KV fix is verified
         num_blocks = seq.num_blocks
         
         for i in range(num_blocks):
@@ -99,7 +100,7 @@ class BlockManager:
                 h = -1
                 
             block_id = self.hash_to_block_id.get(h, -1)
-            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+            if disable_prefix_cache or block_id == -1 or self.blocks[block_id].token_ids != token_ids:
                 cache_miss = True
             
             if cache_miss:

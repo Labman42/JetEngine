@@ -33,6 +33,7 @@ class Config:
     dtype: str = 'auto'
     quantize_fp8: bool = False
     torch_compile: bool = False
+    log_step_signals: bool = False
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
