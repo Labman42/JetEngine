@@ -15,7 +15,7 @@ JetEngine is a lightweight, production-ready inference engine for **block diffus
 
 | GPU | Throughput | Key Optimizations |
 |-----|-----------|-------------------|
-| **NVIDIA H200** | **5,600+ tok/s** | FA3 + CUDA Graphs + Chain Mechanism |
+| **NVIDIA H200** | **7,500+ tok/s** | FA3 + CUDA Graphs + Chain + `dynamic_pmax` |
 | **NVIDIA A800** | **3,000+ tok/s** | FA2 + Triton Kernels + Paged KV Cache |
 
 ## Features
