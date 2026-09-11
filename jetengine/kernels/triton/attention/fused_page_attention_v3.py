@@ -80,26 +80,40 @@ def fused_kv_cache_attention_kernel(
             )
             tokens_in_block = tl.minimum(seq_len_k_cache - kv_pos, block_size)
             num_tiles = (tokens_in_block + BLOCK_N - 1) // BLOCK_N
-            if num_tiles > 0:
-                tile_n = 0
-                actual_n = tl.minimum(tokens_in_block - tile_n, BLOCK_N)
-                k_cache_base = k_cache_ptr + physical_block_id * k_cache_stride_block + kv_head_idx * k_cache_stride_head
-                v_cache_base = v_cache_ptr + physical_block_id * v_cache_stride_block + kv_head_idx * v_cache_stride_head
-                offs_n = (tile_n + n_idx)[:, None] * k_cache_stride_pos
-                k_ptrs = k_cache_base + offs_n + d_idx[None, :] * k_cache_stride_dim
-                v_ptrs = v_cache_base + offs_n + d_idx[None, :] * v_cache_stride_dim
-                kv_mask = (n_idx[:, None] < actual_n) & dim_mask
-                k = tl.load(k_ptrs, mask=kv_mask, other=0.0, cache_modifier=".cg")
-                v = tl.load(v_ptrs, mask=kv_mask, other=0.0, cache_modifier=".cg")
-                for t in range(1, num_tiles):
-                    tile_n_next = t * BLOCK_N
-                    actual_n_next = tl.minimum(tokens_in_block - tile_n_next, BLOCK_N)
-                    offs_n_next = (tile_n_next + n_idx)[:, None] * k_cache_stride_pos
-                    k_ptrs_next = k_cache_base + offs_n_next + d_idx[None, :] * k_cache_stride_dim
-                    v_ptrs_next = v_cache_base + offs_n_next + d_idx[None, :] * v_cache_stride_dim
-                    kv_mask_next = (n_idx[:, None] < actual_n_next) & dim_mask
-                    k_next = tl.load(k_ptrs_next, mask=kv_mask_next, other=0.0, cache_modifier=".cg")
-                    v_next = tl.load(v_ptrs_next, mask=kv_mask_next, other=0.0, cache_modifier=".cg")
+            # Full pages: all prefix lanes are valid; partial page retains original checks.
+            if (tokens_in_block == block_size) & ((block_size % BLOCK_N == 0) & (head_dim == BLOCK_DMODEL)):
+                if num_tiles > 0:
+                    tile_n = 0
+                    actual_n = tl.minimum(tokens_in_block - tile_n, BLOCK_N)
+                    k_cache_base = k_cache_ptr + physical_block_id * k_cache_stride_block + kv_head_idx * k_cache_stride_head
+                    v_cache_base = v_cache_ptr + physical_block_id * v_cache_stride_block + kv_head_idx * v_cache_stride_head
+                    offs_n = (tile_n + n_idx)[:, None] * k_cache_stride_pos
+                    k_ptrs = k_cache_base + offs_n + d_idx[None, :] * k_cache_stride_dim
+                    v_ptrs = v_cache_base + offs_n + d_idx[None, :] * v_cache_stride_dim
+                    kv_mask = (n_idx[:, None] < actual_n) & dim_mask
+                    k = tl.load(k_ptrs, cache_modifier=".cg")
+                    v = tl.load(v_ptrs, cache_modifier=".cg")
+                    for t in range(1, num_tiles):
+                        tile_n_next = t * BLOCK_N
+                        actual_n_next = tl.minimum(tokens_in_block - tile_n_next, BLOCK_N)
+                        offs_n_next = (tile_n_next + n_idx)[:, None] * k_cache_stride_pos
+                        k_ptrs_next = k_cache_base + offs_n_next + d_idx[None, :] * k_cache_stride_dim
+                        v_ptrs_next = v_cache_base + offs_n_next + d_idx[None, :] * v_cache_stride_dim
+                        kv_mask_next = (n_idx[:, None] < actual_n_next) & dim_mask
+                        k_next = tl.load(k_ptrs_next, cache_modifier=".cg")
+                        v_next = tl.load(v_ptrs_next, cache_modifier=".cg")
+                        qk = tl.dot(q, tl.trans(k), allow_tf32=True)
+                        qk = qk.to(tl.float32) * sm_scale
+                        nmask = n_idx[None, :] < actual_n
+                        qk = tl.where(nmask, qk, -float('inf'))
+                        m_new = tl.maximum(m_i, tl.max(qk, axis=1))
+                        alpha = tl.exp2((m_i - m_new) * LOG2E)
+                        p = tl.exp2((qk - m_new[:, None]) * LOG2E)
+                        acc = acc * alpha[:, None] + tl.dot(p, v.to(p.dtype), allow_tf32=True)
+                        l_i = l_i * alpha + tl.sum(p, axis=1)
+                        m_i = m_new
+                        k, v = k_next, v_next
+                        actual_n = actual_n_next
                     qk = tl.dot(q, tl.trans(k), allow_tf32=True)
                     qk = qk.to(tl.float32) * sm_scale
                     nmask = n_idx[None, :] < actual_n
@@ -110,18 +124,49 @@ def fused_kv_cache_attention_kernel(
                     acc = acc * alpha[:, None] + tl.dot(p, v.to(p.dtype), allow_tf32=True)
                     l_i = l_i * alpha + tl.sum(p, axis=1)
                     m_i = m_new
-                    k, v = k_next, v_next
-                    actual_n = actual_n_next
-                qk = tl.dot(q, tl.trans(k), allow_tf32=True)
-                qk = qk.to(tl.float32) * sm_scale
-                nmask = n_idx[None, :] < actual_n
-                qk = tl.where(nmask, qk, -float('inf'))
-                m_new = tl.maximum(m_i, tl.max(qk, axis=1))
-                alpha = tl.exp2((m_i - m_new) * LOG2E)
-                p = tl.exp2((qk - m_new[:, None]) * LOG2E)
-                acc = acc * alpha[:, None] + tl.dot(p, v.to(p.dtype), allow_tf32=True)
-                l_i = l_i * alpha + tl.sum(p, axis=1)
-                m_i = m_new
+            else:
+                if num_tiles > 0:
+                    tile_n = 0
+                    actual_n = tl.minimum(tokens_in_block - tile_n, BLOCK_N)
+                    k_cache_base = k_cache_ptr + physical_block_id * k_cache_stride_block + kv_head_idx * k_cache_stride_head
+                    v_cache_base = v_cache_ptr + physical_block_id * v_cache_stride_block + kv_head_idx * v_cache_stride_head
+                    offs_n = (tile_n + n_idx)[:, None] * k_cache_stride_pos
+                    k_ptrs = k_cache_base + offs_n + d_idx[None, :] * k_cache_stride_dim
+                    v_ptrs = v_cache_base + offs_n + d_idx[None, :] * v_cache_stride_dim
+                    kv_mask = (n_idx[:, None] < actual_n) & dim_mask
+                    k = tl.load(k_ptrs, mask=kv_mask, other=0.0, cache_modifier=".cg")
+                    v = tl.load(v_ptrs, mask=kv_mask, other=0.0, cache_modifier=".cg")
+                    for t in range(1, num_tiles):
+                        tile_n_next = t * BLOCK_N
+                        actual_n_next = tl.minimum(tokens_in_block - tile_n_next, BLOCK_N)
+                        offs_n_next = (tile_n_next + n_idx)[:, None] * k_cache_stride_pos
+                        k_ptrs_next = k_cache_base + offs_n_next + d_idx[None, :] * k_cache_stride_dim
+                        v_ptrs_next = v_cache_base + offs_n_next + d_idx[None, :] * v_cache_stride_dim
+                        kv_mask_next = (n_idx[:, None] < actual_n_next) & dim_mask
+                        k_next = tl.load(k_ptrs_next, mask=kv_mask_next, other=0.0, cache_modifier=".cg")
+                        v_next = tl.load(v_ptrs_next, mask=kv_mask_next, other=0.0, cache_modifier=".cg")
+                        qk = tl.dot(q, tl.trans(k), allow_tf32=True)
+                        qk = qk.to(tl.float32) * sm_scale
+                        nmask = n_idx[None, :] < actual_n
+                        qk = tl.where(nmask, qk, -float('inf'))
+                        m_new = tl.maximum(m_i, tl.max(qk, axis=1))
+                        alpha = tl.exp2((m_i - m_new) * LOG2E)
+                        p = tl.exp2((qk - m_new[:, None]) * LOG2E)
+                        acc = acc * alpha[:, None] + tl.dot(p, v.to(p.dtype), allow_tf32=True)
+                        l_i = l_i * alpha + tl.sum(p, axis=1)
+                        m_i = m_new
+                        k, v = k_next, v_next
+                        actual_n = actual_n_next
+                    qk = tl.dot(q, tl.trans(k), allow_tf32=True)
+                    qk = qk.to(tl.float32) * sm_scale
+                    nmask = n_idx[None, :] < actual_n
+                    qk = tl.where(nmask, qk, -float('inf'))
+                    m_new = tl.maximum(m_i, tl.max(qk, axis=1))
+                    alpha = tl.exp2((m_i - m_new) * LOG2E)
+                    p = tl.exp2((qk - m_new[:, None]) * LOG2E)
+                    acc = acc * alpha[:, None] + tl.dot(p, v.to(p.dtype), allow_tf32=True)
+                    l_i = l_i * alpha + tl.sum(p, axis=1)
+                    m_i = m_new
             kv_pos += tokens_in_block
         num_tiles_cur = (block_len + BLOCK_N - 1) // BLOCK_N
         if num_tiles_cur > 0:
